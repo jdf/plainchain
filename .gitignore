@@ -2,3 +2,4 @@
 /app/.build
 /app/.swiftpm
 .DS_Store
+/drafts

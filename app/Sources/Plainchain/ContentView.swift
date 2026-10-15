@@ -125,6 +125,7 @@ struct ChainView: View {
                 }
                 .popover(isPresented: $showingPicker, arrowEdge: .bottom) {
                     PluginPicker { model.add($0); showingPicker = false }
+                        .onAppear { model.refreshPlugins() }
                 }
             }
             ScrollView {

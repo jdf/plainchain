@@ -53,6 +53,10 @@ final class Model: ObservableObject {
         session = Self.defaultSession(devices)
         enabled = true  // the engine runs from launch; the Run switch is for pausing
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        // macOS registers newly installed Audio Units on its own; it tells us when the set changes.
+        NotificationCenter.default.addObserver(forName: Notification.Name(kAudioComponentRegistrationsChangedNotification as String), object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refreshPlugins() }
+        }
         Task {
             if let path = UserDefaults.standard.string(forKey: Self.sessionPathKey), FileManager.default.fileExists(atPath: path) {
                 await open(URL(fileURLWithPath: path), quietly: true)
@@ -180,6 +184,12 @@ final class Model: ObservableObject {
 
     func refreshDevices() {
         if let d = try? HAL.devices(), d != devices { devices = d }
+    }
+
+    /// Re-read the installed Audio Units from the system registry.
+    func refreshPlugins() {
+        let p = Plugins.installed()
+        if p != plugins { plugins = p }
     }
 
     // MARK: Sessions
