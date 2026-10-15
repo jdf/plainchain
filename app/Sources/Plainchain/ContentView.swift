@@ -465,9 +465,14 @@ struct PluginPicker: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TextField("Search plugins", text: $query)
-                .textFieldStyle(.roundedBorder)
-                .padding(8)
+            HStack(spacing: 6) {
+                TextField("Search plugins", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                Button { model.refreshPlugins() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless)
+                    .help("Rescan installed Audio Units")
+            }
+            .padding(8)
             List {
                 ForEach(grouped, id: \.0) { manufacturer, plugins in
                     Section(manufacturer) {
