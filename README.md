@@ -8,6 +8,8 @@ A macOS app that does exactly three things:
 
 Sessions (devices, chain, and every plugin's state) save to `.plainchain` files: SQLite databases whose rows are Cap'n Proto messages.
 
+<img src="docs/screenshot.png" width="480" alt="Plainchain with two plugins in the chain">
+
 ## Layout
 
 | Path | What |
