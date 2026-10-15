@@ -450,7 +450,14 @@ struct ReductionView: View {
 struct PluginPicker: View {
     @EnvironmentObject private var model: Model
     @State private var query = ""
+    @State private var scanning = false
     let choose: (Plugin) -> Void
+
+    private func rescan() {
+        scanning = true
+        model.refreshPlugins()
+        Task { try? await Task.sleep(for: .milliseconds(500)); scanning = false }
+    }
 
     private var filtered: [Plugin] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
@@ -468,9 +475,14 @@ struct PluginPicker: View {
             HStack(spacing: 6) {
                 TextField("Search plugins", text: $query)
                     .textFieldStyle(.roundedBorder)
-                Button { model.refreshPlugins() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless)
-                    .help("Rescan installed Audio Units")
+                if scanning {
+                    ProgressView().controlSize(.small).frame(width: 20)
+                } else {
+                    Button(action: rescan) { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless)
+                        .frame(width: 20)
+                        .help("Rescan installed Audio Units")
+                }
             }
             .padding(8)
             List {
@@ -486,6 +498,10 @@ struct PluginPicker: View {
                 }
             }
             .listStyle(.inset)
+            Text(scanning ? "Scanning…" : "\(model.plugins.count) Audio Units installed")
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10).padding(.vertical, 5)
         }
         .frame(width: 320, height: 420)
     }
