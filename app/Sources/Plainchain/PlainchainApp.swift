@@ -31,6 +31,9 @@ struct PlainchainApp: App {
                 Button("Save") { model.saveSession() }.keyboardShortcut("s")
                 Button("Save As…") { model.saveSessionAs() }.keyboardShortcut("s", modifiers: [.command, .shift])
             }
+            CommandMenu("Plugins") {
+                Button("Rescan Plugins") { model.refreshPlugins() }.keyboardShortcut("r")
+            }
         }
     }
 }
