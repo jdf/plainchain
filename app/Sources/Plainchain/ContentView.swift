@@ -36,7 +36,8 @@ struct EndpointView: View {
     }
 
     var body: some View {
-        GroupBox(title) {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
             VStack(alignment: .leading, spacing: 8) {
                 Picker("Device", selection: Binding(
                     get: { endpoint.deviceUid },
@@ -62,7 +63,10 @@ struct EndpointView: View {
                     }
                 }
             }
-            .padding(4)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .windowBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color(nsColor: .separatorColor)))
         }
     }
 }
@@ -244,7 +248,7 @@ struct ChainRow<Handle: Gesture>: View {
                 get: { item.inputGainDb },
                 set: { v in model.update { $0.chain[index].inputGainDb = v } }
             ))
-            MeterView(peaks: levels.peaks[item.id] ?? [])
+            MeterView(peaks: levels.peaks[item.id] ?? Array(repeating: 0, count: max(model.session.input.channels.count, 1)))
             PowerButton(on: !item.bypass) { model.update { $0.chain[index].bypass.toggle() } }
             VStack(alignment: .leading) {
                 Text(model.name(of: item.plugin))
@@ -290,6 +294,8 @@ struct PowerButton: View {
                 .background(on ? Color.green : Color(nsColor: .tertiaryLabelColor), in: Circle())
         }
         .buttonStyle(.plain)
+        .focusable(false)
+        .focusEffectDisabled()
         .help(help ?? (on ? "On (click to bypass)" : "Bypassed (click to enable)"))
     }
 }
@@ -303,15 +309,12 @@ struct Header: View {
             PowerButton(on: model.enabled, size: 28, help: model.enabled ? "Running (click to stop)" : "Stopped (click to start)") {
                 model.enabled.toggle()
             }
+            Text(model.title).font(.title3)
             if let error = model.error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
                     .lineLimit(2)
                     .help(error)
-            } else if model.status.running {
-                Text(model.status.deviceName).foregroundStyle(.secondary)
-            } else {
-                Text(model.enabled ? "Starting…" : "Stopped").foregroundStyle(.secondary)
             }
             Spacer()
             if model.busy { ProgressView().controlSize(.small) }
@@ -495,37 +498,33 @@ struct StatusBar: View {
     var body: some View {
         let s = model.status
         HStack(spacing: 16) {
-            if s.running {
-                stat("Sample rate", "\(Self.hz.string(from: s.sampleRate as NSNumber) ?? "") Hz")
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Buffer").foregroundStyle(.tertiary)
-                    HStack(spacing: 4) {
-                        Picker("", selection: Binding(get: { s.bufferFrames }, set: { model.setBufferSize($0) })) {
-                            ForEach(model.bufferSizeChoices, id: \.self) { Text("\($0)").tag($0) }
-                            if !model.bufferSizeChoices.contains(s.bufferFrames) { Text("\(s.bufferFrames)").tag(s.bufferFrames) }
-                        }
-                        .labelsHidden()
-                        .controlSize(.mini)
-                        .fixedSize()
-                        Text(String(format: "samples · %.1f ms", s.bufferMs))
+            stat("Sample rate", "\(Self.hz.string(from: s.sampleRate as NSNumber) ?? "0") Hz")
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Buffer").foregroundStyle(.tertiary)
+                HStack(spacing: 4) {
+                    Picker("", selection: Binding(get: { s.bufferFrames }, set: { model.setBufferSize($0) })) {
+                        ForEach(model.bufferSizeChoices, id: \.self) { Text("\($0)").tag($0) }
+                        if !model.bufferSizeChoices.contains(s.bufferFrames) { Text("\(s.bufferFrames)").tag(s.bufferFrames) }
                     }
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .fixedSize()
+                    .disabled(!s.running)
+                    Text(String(format: "samples · %.1f ms", s.bufferMs))
                 }
-                .help("Device IO buffer. Smaller is lower latency but more CPU; this setting is shared with other apps using the device.")
-                stat("Latency", String(format: "≈ %.1f ms round trip", s.ms(s.roundTripFrames)))
-                    .help(String(format: "Input buffer %.1f + device in %.1f + plugins %.1f + device out %.1f + output buffer %.1f ms",
-                                 s.bufferMs, s.ms(s.inputLatencyFrames), s.ms(s.pluginLatencyFrames), s.ms(s.outputLatencyFrames), s.bufferMs))
-                if s.pluginLatencyFrames > 0 {
-                    stat("Plugins", String(format: "%.1f ms", s.ms(s.pluginLatencyFrames)))
-                }
-                if s.renderErrors > 0 {
-                    stat("Input errors", "\(s.renderErrors)").foregroundStyle(.red)
-                }
-            } else {
-                Text("Engine stopped").foregroundStyle(.secondary)
+            }
+            .help("Device IO buffer. Smaller is lower latency but more CPU; this setting is shared with other apps using the device.")
+            stat("Latency", String(format: "≈ %.1f ms round trip", s.ms(s.roundTripFrames)))
+                .help(String(format: "Input buffer %.1f + device in %.1f + plugins %.1f + device out %.1f + output buffer %.1f ms",
+                             s.bufferMs, s.ms(s.inputLatencyFrames), s.ms(s.pluginLatencyFrames), s.ms(s.outputLatencyFrames), s.bufferMs))
+            stat("Plugins", String(format: "%.1f ms", s.ms(s.pluginLatencyFrames)))
+            if s.renderErrors > 0 {
+                stat("Input errors", "\(s.renderErrors)").foregroundStyle(.red)
             }
             Spacer()
         }
         .font(.caption.monospacedDigit())
+        .foregroundStyle(s.running ? .primary : .tertiary)
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
