@@ -36,6 +36,14 @@ PC_IN="Loopback" PC_OUT="MacBook Air Speakers" make smoke PLUGINS="AUDelay AUGra
 
 Requires Xcode (Swift 6) and Homebrew's `capnp` (`brew install capnp`) for its static library and headers; the `capnp` compiler itself is only needed to regenerate code after a schema change. Cap'n Proto is linked statically, so the bundle has no Homebrew dependency at runtime. The app must run from the bundle so macOS can ask for microphone access.
 
+## Distributing
+
+```sh
+make dist       # sign, notarize (waits for Apple), staple, zip -> build/Plainchain.zip
+```
+
+Needs the `plainchain` notarytool keychain profile, created once with `xcrun notarytool store-credentials plainchain --apple-id <id> --team-id 6RMZ7JM472`.
+
 ## How the engine works
 
 One CoreAudio HAL output unit handles both input (bus 1) and output (bus 0). When the chosen input and output are the same device, it is used directly. When they differ, the app creates a private aggregate device of the two, with the output device as clock master and drift compensation on the input, so CoreAudio handles clock drift and differing sample rates. The aggregate is destroyed when the graph is torn down.
@@ -65,6 +73,6 @@ Saves write a fresh database beside the target and swap it in atomically.
 Constraints:
 
 - The chain runs at the width of the input selection: one input channel means mono through every plugin. Plugins that only accept stereo fail to initialize with "format not supported"; select two input channels.
-- Changing devices, channels, or chain order tears down and rebuilds the graph (a brief dropout). Bypass is applied live.
+- Changing devices, channels, or adding or removing a plugin tears down and rebuilds the graph (a brief dropout). Reordering is live: the output fades to silence over 8 ms, the stages are repointed on the render thread, and it fades back in. Bypass and trim are applied live.
 
 The engine starts running at launch; the Run switch pauses it. State between launches lives in `~/Library/Application Support/Plainchain/Autosave.plainchain`; the path of the last explicitly opened or saved session is in `defaults read com.plainchain.app`.
