@@ -87,13 +87,20 @@ final class Model: ObservableObject {
         var next = session
         mutate(&next)
         guard next != session else { return }
-        let liveOnly = next.input == session.input && next.output == session.output && next.bufferFrames == session.bufferFrames
-            && next.chain.map(\.plugin) == session.chain.map(\.plugin) && next.chain.map(\.id) == session.chain.map(\.id)
+        let sameSetup = next.input == session.input && next.output == session.output && next.bufferFrames == session.bufferFrames
+        let liveOnly = sameSetup && next.chain.map(\.id) == session.chain.map(\.id)
+        // A pure reorder: same items, same settings, different order.
+        let oldIds = session.chain.map(\.id)
+        let reorder: [Int]? = sameSetup && Set(oldIds) == Set(next.chain.map(\.id)) && oldIds != next.chain.map(\.id)
+            && next.chain.allSatisfy({ item in session.chain.contains { $0 == item } })
+            ? next.chain.map { item in oldIds.firstIndex(of: item.id)! } : nil
         let changed = zip(session.chain, next.chain).enumerated().filter { $1.0 != $1.1 }
         session = next
         markDirty()
         guard enabled else { return }
-        if liveOnly, let engine {
+        if let reorder, let engine {
+            engine.reorder(reorder)
+        } else if liveOnly, let engine {
             for (i, (old, item)) in changed {
                 if old.bypass != item.bypass {
                     do { try engine.setBypass(i, item.bypass) } catch { self.error = error.localizedDescription }
@@ -305,13 +312,13 @@ final class Model: ObservableObject {
         } catch {
             self.error = error.localizedDescription
         }
-        status = engine?.status ?? Engine.Status()
+        if let engine { status = engine.status } else { status.running = false }
     }
 
     private func stop() {
         restartTask?.cancel()
         engine = nil
-        status = Engine.Status()
+        status.running = false  // keep the last readings so the status bar stays put, just grayed
         error = nil
     }
 

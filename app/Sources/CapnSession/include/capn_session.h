@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "pc_atomic.h"
 
 #ifdef __cplusplus
 extern "C" {

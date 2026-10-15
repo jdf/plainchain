@@ -80,6 +80,14 @@ enum Smoke {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 2))
         print("status:", engine.status)
         print("peaks per stage:", (0...units.count).map { engine.takePeaks($0) })
+        if units.count >= 2 {
+            engine.reorder(Array((0..<units.count).reversed()))
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+            print("reorder applied:", !engine.swapPending, "errors:", engine.status.renderErrors)
+            engine.reorder(Array((0..<units.count).reversed()))
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+            print("reorder back applied:", !engine.swapPending, "errors:", engine.status.renderErrors)
+        }
         _ = engine
 
         // Session round trip with plugin state.

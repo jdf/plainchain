@@ -1,5 +1,6 @@
 import Accelerate
 import AudioToolbox
+import CapnSession
 import CoreAudio
 import Foundation
 
@@ -16,6 +17,10 @@ import Foundation
 /// then applies that stage's trim gain and records the peak level. Stage `i`
 /// feeds effect `i`; the last stage feeds the HAL output. There is no
 /// intermediate buffer and no added latency beyond the device's own.
+///
+/// Reordering is live: the output stage fades to silence, repoints every
+/// stage's upstream on the render thread, and fades back in, so nothing is
+/// uninitialized and plugin state carries through.
 ///
 /// Plugin instances are owned by the caller; the engine only configures,
 /// wires, and (un)initializes them.
@@ -55,7 +60,11 @@ final class Engine {
     /// One per effect, plus one feeding the HAL output.
     private let stages: UnsafeMutablePointer<StageContext>
     private let stageCount: Int
+    /// Chain position -> stage slot. Slot i is the stage wired into effect i's
+    /// input; after a reorder the slots are the same but their order differs.
+    private var slots: [Int]
     private var tornDown = false
+    private var started = false
     private(set) var sampleRate = 0.0
     private(set) var width = 0
     private(set) var deviceName = ""
@@ -78,6 +87,7 @@ final class Engine {
     init(input: Endpoint, output: Endpoint, devices: [Device], stages chain: [Stage], bufferFrames: Int = 0) throws {
         effects = chain.map(\.unit)
         stageCount = chain.count + 1
+        slots = Array(0..<chain.count)
         stages = .allocate(capacity: stageCount)
         for i in 0..<stageCount {
             let gainDb = i < chain.count ? chain[i].gainDb : 0
@@ -96,15 +106,39 @@ final class Engine {
 
     static func linear(_ db: Float) -> Float { powf(10, db / 20) }
 
-    /// Live trim change for the stage feeding effect `index`.
-    func setGain(_ index: Int, db: Float) {
-        guard index >= 0, index < stageCount else { return }
-        stages[index].gain = Engine.linear(db)
+    private func slot(_ position: Int) -> Int? {
+        position == effects.count ? effects.count : slots.indices.contains(position) ? slots[position] : nil
     }
 
+    /// Live trim change for the stage feeding the plugin at chain `position`.
+    func setGain(_ position: Int, db: Float) {
+        guard let i = slot(position) else { return }
+        stages[i].gain = Engine.linear(db)
+    }
+
+    /// Reorder the chain without rebuilding: `newOrder[p]` is the old position
+    /// of the plugin now at position `p`. The swap happens on the render thread
+    /// under a short fade.
+    func reorder(_ newOrder: [Int]) {
+        guard newOrder.count == effects.count, Set(newOrder) == Set(0..<effects.count) else { return }
+        let newSlots = newOrder.map { slots[$0] }
+        for (p, i) in newSlots.enumerated() {
+            stages[i].pendingUpstream = p == 0 ? hal : effects[newSlots[p - 1]]
+            stages[i].pendingBus = p == 0 ? 1 : 0
+        }
+        let out = stages.advanced(by: effects.count)
+        out.pointee.pendingUpstream = newSlots.last.map { effects[$0] } ?? hal
+        out.pointee.pendingBus = newSlots.isEmpty ? 1 : 0
+        slots = newSlots
+        pc_store_u32(&out.pointee.swapRequested, 1)
+    }
+
+    /// True while a reorder is waiting for the render thread to apply it.
+    var swapPending: Bool { pc_load_u32(&stages[stageCount - 1].swapRequested) != 0 }
+
     /// Peak level per channel since the last call, linear; resets the hold.
-    func takePeaks(_ index: Int) -> [Float] {
-        guard index >= 0, index < stageCount else { return [] }
+    func takePeaks(_ position: Int) -> [Float] {
+        guard let index = slot(position) else { return [] }
         let ctx = stages.advanced(by: index)
         return (0..<width).map { c in
             let v = ctx.pointee.peaks[c]
@@ -113,10 +147,10 @@ final class Engine {
         }
     }
 
-    func setBypass(_ index: Int, _ bypass: Bool) throws {
-        guard effects.indices.contains(index) else { throw EngineError("no plugin at \(index)") }
+    func setBypass(_ position: Int, _ bypass: Bool) throws {
+        guard let i = slot(position), i < effects.count else { throw EngineError("no plugin at \(position)") }
         var b: UInt32 = bypass ? 1 : 0
-        try set(effects[index], kAudioUnitProperty_BypassEffect, kAudioUnitScope_Global, 0, &b, "bypass")
+        try set(effects[i], kAudioUnitProperty_BypassEffect, kAudioUnitScope_Global, 0, &b, "bypass")
     }
 
     private static func newHAL() throws -> AudioUnit {
@@ -157,6 +191,14 @@ final class Engine {
         sampleRate = try HAL.sampleRate(device)
         width = input.channels.count
         for i in 0..<stageCount { stages[i].width = width }
+        // Output stage fades over 8 ms when the chain is rewired, and in from silence at start.
+        stages[stageCount - 1].fadeStep = Float(1000.0 / (8.0 * sampleRate))
+        stages[stageCount - 1].fade = 0
+        stages[stageCount - 1].fadeTarget = 1
+        stages[stageCount - 1].holdFrames = Int(0.08 * sampleRate)
+        stages[stageCount - 1].isOutput = true
+        stages[stageCount - 1].allStages = stages
+        stages[stageCount - 1].stageCount = stageCount
         let deviceOutputs = try HAL.channelCount(device, kAudioObjectPropertyScopeOutput)
         var format = AudioStreamBasicDescription(
             mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
@@ -212,6 +254,7 @@ final class Engine {
         }
         try check(AudioUnitInitialize(hal), "HAL unit: initialize")
         try check(AudioOutputUnitStart(hal), "start")
+        started = true
 
         // ---- Latency bookkeeping (informational; failures here are not fatal).
         bufferSizeChoices = HAL.bufferSizeChoices(device)
@@ -256,6 +299,14 @@ final class Engine {
     private func teardown() {
         guard !tornDown else { return }
         tornDown = true
+        if started {
+            // Fade out before the device stops, so stopping is not a hard cut.
+            let out = stages.advanced(by: stageCount - 1)
+            pc_store_u32(&out.pointee.swapRequested, 0)
+            out.pointee.fadeTarget = 0
+            let deadline = Date(timeIntervalSinceNow: 0.1)
+            while out.pointee.fade > 0, Date() < deadline { usleep(1000) }
+        }
         // Stop the IO thread before anything the callbacks touch goes away.
         AudioOutputUnitStop(hal)
         AudioUnitUninitialize(hal)
@@ -284,6 +335,23 @@ struct StageContext {
     var peaks: UnsafeMutablePointer<Float>
     var renderErrors: UInt64 = 0
 
+    // Live rewiring. The UI thread fills `pending*` on every stage, then sets
+    // `swapRequested` on the output stage; the output stage's callback fades
+    // out, copies pending -> active for every stage, and fades back in.
+    var pendingUpstream: AudioUnit?
+    var pendingBus: UInt32 = 0
+    var isOutput = false
+    /// Output stage only: the whole stage array, for the swap.
+    var allStages: UnsafeMutablePointer<StageContext>?
+    var stageCount = 0
+    var swapRequested: UInt32 = 0
+    var fade: Float = 1
+    var fadeTarget: Float = 1
+    var fadeStep: Float = 0
+    /// Output stage only: frames of enforced silence after start, while the
+    /// plugins and the device input settle. Counts down on the render thread.
+    var holdFrames: Int = 0
+
     init(gain: Float) {
         self.gain = gain
         peaks = .allocate(capacity: Engine.maxChannels)
@@ -296,6 +364,20 @@ struct StageContext {
 private let stageRender: AURenderCallback = { refCon, flags, timestamp, _, frames, ioData in
     let ctx = refCon.assumingMemoryBound(to: StageContext.self)
     guard let ioData else { return noErr }
+    if ctx.pointee.isOutput {
+        if pc_load_u32(&ctx.pointee.swapRequested) != 0 {
+            ctx.pointee.fadeTarget = 0
+            if ctx.pointee.fade == 0, let all = ctx.pointee.allStages {
+                // Silent: safe to repoint every stage.
+                for i in 0..<ctx.pointee.stageCount {
+                    all[i].upstream = all[i].pendingUpstream
+                    all[i].upstreamBus = all[i].pendingBus
+                }
+                pc_store_u32(&ctx.pointee.swapRequested, 0)
+                ctx.pointee.fadeTarget = 1
+            }
+        }
+    }
     guard let upstream = ctx.pointee.upstream else { silence(ioData); return noErr }
     let status = AudioUnitRender(upstream, flags, timestamp, ctx.pointee.upstreamBus, frames, ioData)
     if status != noErr {
@@ -313,6 +395,27 @@ private let stageRender: AURenderCallback = { refCon, flags, timestamp, _, frame
         var peak: Float = 0
         vDSP_maxmgv(p, 1, &peak, n)
         if peak > ctx.pointee.peaks[c] { ctx.pointee.peaks[c] = peak }
+    }
+    if ctx.pointee.isOutput, ctx.pointee.holdFrames > 0 {
+        // Warm-up: everything upstream has rendered, but keep the output silent.
+        ctx.pointee.holdFrames -= Int(frames)
+        silence(ioData)
+    } else if ctx.pointee.isOutput, ctx.pointee.fade != ctx.pointee.fadeTarget {
+        // Linear ramp toward the target, continuing across buffers if needed.
+        let start = ctx.pointee.fade
+        let target = ctx.pointee.fadeTarget
+        let maxDelta = ctx.pointee.fadeStep * Float(frames)
+        let end = target > start ? min(start + maxDelta, target) : max(start - maxDelta, target)
+        var step = (end - start) / Float(frames)
+        for c in 0..<min(buffers.count, ctx.pointee.width) {
+            guard let data = buffers[c].mData else { continue }
+            let p = data.assumingMemoryBound(to: Float.self)
+            var s = start  // vDSP_vrampmul advances `s` in place, so each channel needs its own copy
+            vDSP_vrampmul(p, 1, &s, &step, p, 1, n)
+        }
+        ctx.pointee.fade = end
+    } else if ctx.pointee.isOutput, ctx.pointee.fade == 0 {
+        silence(ioData)
     }
     return noErr
 }
