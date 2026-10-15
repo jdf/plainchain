@@ -42,7 +42,7 @@ Requires Xcode (Swift 6) and Homebrew's `capnp` (`brew install capnp`) for its s
 make dist       # sign, notarize (waits for Apple), staple, zip -> build/Plainchain.zip
 ```
 
-Needs the `plainchain` notarytool keychain profile, created once with `xcrun notarytool store-credentials plainchain --apple-id <id> --team-id 6RMZ7JM472`.
+Needs a notarytool keychain profile, created once with `xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team>`. The Makefile picks the first Developer ID certificate in your keychain and the profile named `plainchain`; override with `make dist SIGN="Developer ID Application: ..." PROFILE=<profile>`.
 
 ## How the engine works
 
@@ -76,3 +76,7 @@ Constraints:
 - Changing devices, channels, or adding or removing a plugin tears down and rebuilds the graph (a brief dropout). Reordering is live: the output fades to silence over 8 ms, the stages are repointed on the render thread, and it fades back in. Bypass and trim are applied live.
 
 The engine starts running at launch; the Run switch pauses it. State between launches lives in `~/Library/Application Support/Plainchain/Autosave.plainchain`; the path of the last explicitly opened or saved session is in `defaults read com.plainchain.app`.
+
+## License
+
+MIT. See `LICENSE`.

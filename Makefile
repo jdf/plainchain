@@ -7,8 +7,9 @@ ICON    := $(BUILD)/AppIcon.icns
 ICONSRC := app/Assets/icon-1024.png
 # A real signing identity keeps the microphone permission across rebuilds; ad-hoc ("-") does not.
 # Hardened runtime, with entitlements that let third-party plugins load in-process.
-SIGN    := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1)
+SIGN    ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1)
 SIGN    := $(if $(SIGN),$(SIGN),-)
+PROFILE ?= plainchain
 
 .PHONY: all app bundle run install smoke clean icon notarize dist
 
@@ -47,12 +48,12 @@ install: bundle
 	touch "/Applications/$(APP).app"   # nudge Finder and the Dock to pick up the icon
 
 # Notarize the bundle so copies run anywhere without a Gatekeeper override.
-# One-time setup: xcrun notarytool store-credentials plainchain --apple-id ... --team-id 6RMZ7JM472
+# One-time setup: xcrun notarytool store-credentials $(PROFILE) --apple-id ... --team-id ...
 ZIP := $(BUILD)/$(APP).zip
 notarize: bundle
 	rm -f "$(ZIP)"
 	ditto -c -k --keepParent "$(BUNDLE)" "$(ZIP)"
-	xcrun notarytool submit "$(ZIP)" --keychain-profile plainchain --wait
+	xcrun notarytool submit "$(ZIP)" --keychain-profile $(PROFILE) --wait
 	xcrun stapler staple "$(BUNDLE)"
 	spctl --assess --type execute --verbose=2 "$(BUNDLE)"
 
