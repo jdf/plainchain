@@ -43,6 +43,11 @@ float pc_chain_item_input_gain_db(const pc_chain_item *c);
 pc_bytes pc_chain_item_state(const pc_chain_item *c);
 void pc_chain_item_free(pc_chain_item *c);
 
+/* ---- Settings ---- */
+pc_buf pc_settings_encode(uint32_t buffer_frames);
+/* Returns false if malformed. */
+bool pc_settings_decode(const uint8_t *bytes, size_t len, uint32_t *buffer_frames);
+
 #ifdef __cplusplus
 }
 #endif

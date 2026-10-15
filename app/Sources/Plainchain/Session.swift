@@ -6,6 +6,7 @@ import SQLite3
 ///     meta(key TEXT PRIMARY KEY, value TEXT)          -- version, saved time
 ///     endpoint(role TEXT PRIMARY KEY, message BLOB)   -- 'input' / 'output', an Endpoint
 ///     chain(position INTEGER PRIMARY KEY, message BLOB) -- a ChainItem per slot, in order
+///     settings(message BLOB)                          -- one Settings row (absent in older files)
 ///
 /// `PRAGMA application_id` is 'PLCH' and `user_version` is the format version.
 enum SessionFile {
@@ -27,7 +28,11 @@ enum SessionFile {
         try db.query("SELECT message FROM chain ORDER BY position") { row in
             chain.append(try Capn.decodeChainItem(row.blob(0)))
         }
-        return Session(input: input, output: output, chain: chain)
+        var bufferFrames = 0
+        if try db.scalarInt("SELECT count(*) FROM sqlite_master WHERE name = 'settings'") > 0 {
+            try db.query("SELECT message FROM settings LIMIT 1") { row in bufferFrames = try Capn.decodeSettings(row.blob(0)) }
+        }
+        return Session(input: input, output: output, chain: chain, bufferFrames: bufferFrames)
     }
 
     /// Writes a fresh database beside the target and swaps it in, so a failed
@@ -53,6 +58,8 @@ enum SessionFile {
             try db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             try db.exec("CREATE TABLE endpoint (role TEXT PRIMARY KEY, message BLOB NOT NULL)")
             try db.exec("CREATE TABLE chain (position INTEGER PRIMARY KEY, message BLOB NOT NULL)")
+            try db.exec("CREATE TABLE settings (message BLOB NOT NULL)")
+            try db.run("INSERT INTO settings VALUES (?)", [.blob(Capn.encodeSettings(bufferFrames: session.bufferFrames))])
             try db.run("INSERT INTO meta VALUES ('saved', ?)", [.text(ISO8601DateFormatter().string(from: Date()))])
             try db.run("INSERT INTO meta VALUES ('app', ?)", [.text("Plainchain")])
             try db.run("INSERT INTO endpoint VALUES ('input', ?)", [.blob(Capn.encode(session.input))])

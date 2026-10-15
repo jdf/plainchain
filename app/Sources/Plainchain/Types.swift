@@ -62,6 +62,8 @@ struct Session: Equatable {
     var input: Endpoint
     var output: Endpoint
     var chain: [ChainItem] = []
+    /// Requested device IO buffer in frames; 0 leaves the device's current size alone.
+    var bufferFrames = 0
 }
 
 struct EngineError: LocalizedError {

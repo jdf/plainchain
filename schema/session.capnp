@@ -16,3 +16,7 @@ struct ChainItem {
   state        @5 :Data;        # AUAudioUnit.fullState as a binary plist; empty if none
   inputGainDb  @6 :Float32;     # trim applied before the plugin, in dB (0 = unity)
 }
+
+struct Settings {
+  bufferFrames @0 :UInt32;      # requested device IO buffer; 0 leaves the device's current size
+}

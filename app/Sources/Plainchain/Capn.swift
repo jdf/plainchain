@@ -48,4 +48,17 @@ enum Capn {
             state: state.len > 0 ? Data(bytes: state.bytes, count: state.len) : nil
         )
     }
+
+    static func encodeSettings(bufferFrames: Int) -> Data {
+        let buf = pc_settings_encode(UInt32(max(bufferFrames, 0)))
+        defer { pc_buf_free(buf) }
+        return Data(bytes: buf.bytes, count: buf.len)
+    }
+
+    static func decodeSettings(_ data: Data) throws -> Int {
+        var frames: UInt32 = 0
+        let ok = data.withUnsafeBytes { pc_settings_decode($0.baseAddress?.assumingMemoryBound(to: UInt8.self), $0.count, &frames) }
+        guard ok else { throw EngineError("malformed settings record") }
+        return Int(frames)
+    }
 }

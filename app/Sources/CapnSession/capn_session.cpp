@@ -52,6 +52,8 @@ template <> void Reader<Endpoint>::validate() {
     root.getChannels();
 }
 
+template <> void Reader<Settings>::validate() { root.getBufferFrames(); }
+
 template <> void Reader<ChainItem>::validate() {
     root.getId(); root.getType(); root.getSubtype(); root.getManufacturer(); root.getState();
 }
@@ -110,5 +112,19 @@ pc_bytes pc_chain_item_state(const pc_chain_item *c) {
     return pc_bytes{d.begin(), d.size()};
 }
 void pc_chain_item_free(pc_chain_item *c) { delete c; }
+
+pc_buf pc_settings_encode(uint32_t buffer_frames) {
+    capnp::MallocMessageBuilder message;
+    message.initRoot<Settings>().setBufferFrames(buffer_frames);
+    return toBuf(message);
+}
+
+bool pc_settings_decode(const uint8_t *bytes, size_t len, uint32_t *buffer_frames) {
+    Reader<Settings> *r = Reader<Settings>::make(bytes, len);
+    if (!r) return false;
+    *buffer_frames = r->root.getBufferFrames();
+    delete r;
+    return true;
+}
 
 }  // extern "C"

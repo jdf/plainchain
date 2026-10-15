@@ -36,6 +36,27 @@ enum Smoke {
             guard let p = plugins.first(where: { $0.name == n || $0.id.subtype == n }) else { throw EngineError("no plugin \(n)") }
             let unit = try wait { try await Plugins.instantiate(p.id) }
             print("  \(p.name): \(Plugins.v2Parameters(unit.audioUnit).count) params; gain reduction meter: \(Plugins.gainReductionMeter(unit.audioUnit).map { "param \($0.id)" } ?? "none")")
+            if env["PC_UI"] != nil {
+                var size: UInt32 = 0
+                var writable: DarwinBoolean = false
+                let st = AudioUnitGetPropertyInfo(unit.audioUnit, kAudioUnitProperty_CocoaUI, kAudioUnitScope_Global, 0, &size, &writable)
+                print("    CocoaUI property: status \(st) size \(size)")
+                if st == noErr, size > 0 {
+                    let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 8)
+                    defer { raw.deallocate() }
+                    if AudioUnitGetProperty(unit.audioUnit, kAudioUnitProperty_CocoaUI, kAudioUnitScope_Global, 0, raw, &size) == noErr {
+                        let info = raw.assumingMemoryBound(to: AudioUnitCocoaViewInfo.self).pointee
+                        let url = info.mCocoaAUViewBundleLocation.takeUnretainedValue() as URL
+                        let cls = info.mCocoaAUViewClass.takeUnretainedValue() as String
+                        print("    UI bundle: \(url.path) class: \(cls)")
+                        let bundle = Bundle(url: url)
+                        var err: NSError?
+                        let loaded = (try? bundle?.loadAndReturnError()) != nil
+                        if let bundle, !loaded { do { try bundle.loadAndReturnError() } catch { err = error as NSError } }
+                        print("    bundle loaded: \(loaded) \(err.map { "error: \($0)" } ?? "") class found: \(NSClassFromString(cls) != nil)")
+                    }
+                }
+            }
             if env["PC_PARAMS"] != nil {
                 for q in Plugins.v2Parameters(unit.audioUnit) {
                     print("    v2 \(q.id) '\(q.name)' flags=\(String(q.flags, radix: 16)) unit=\(q.unit) [\(q.min)...\(q.max)]")
@@ -50,11 +71,12 @@ enum Smoke {
         let session = Session(
             input: Endpoint(deviceUid: inp.uid, channels: Array(0..<min(inp.inputChannels, 2))),
             output: Endpoint(deviceUid: out.uid, channels: Array(0..<min(out.outputChannels, 2))),
-            chain: chain
+            chain: chain,
+            bufferFrames: Int(env["PC_BUFFER"] ?? "") ?? 0
         )
         print("session: \(inp.name) \(session.input.channels) -> \(names.joined(separator: " -> ")) -> \(out.name) \(session.output.channels)")
         let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb) }
-        let engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages)
+        let engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 2))
         print("status:", engine.status)
         print("peaks per stage:", (0...units.count).map { engine.takePeaks($0) })

@@ -87,7 +87,7 @@ final class Model: ObservableObject {
         var next = session
         mutate(&next)
         guard next != session else { return }
-        let liveOnly = next.input == session.input && next.output == session.output
+        let liveOnly = next.input == session.input && next.output == session.output && next.bufferFrames == session.bufferFrames
             && next.chain.map(\.plugin) == session.chain.map(\.plugin) && next.chain.map(\.id) == session.chain.map(\.id)
         let changed = zip(session.chain, next.chain).enumerated().filter { $1.0 != $1.1 }
         session = next
@@ -118,6 +118,8 @@ final class Model: ObservableObject {
                 let item = ChainItem(plugin: plugin.id)
                 register(try await Plugins.instantiate(plugin.id), for: item.id)
                 update { $0.chain.append(item) }
+                // Some plugins only offer their view once initialized, so wait for the rebuild.
+                await restartTask?.value
                 openEditor(item)
             } catch {
                 self.error = "\(plugin.name): \(error.localizedDescription)"
@@ -158,6 +160,8 @@ final class Model: ObservableObject {
     var bufferSizeChoices: [Int] { engine?.bufferSizeChoices ?? [] }
 
     func setBufferSize(_ frames: Int) {
+        session.bufferFrames = frames
+        markDirty()
         guard let engine else { return }
         do {
             try engine.setBufferSize(frames)
@@ -296,7 +300,7 @@ final class Model: ObservableObject {
         guard units.count == session.chain.count else { return }
         do {
             let stages = zip(units, session.chain).map { Engine.Stage(unit: $0, bypass: $1.bypass, gainDb: $1.inputGainDb) }
-            engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages)
+            engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
             error = nil
         } catch {
             self.error = error.localizedDescription

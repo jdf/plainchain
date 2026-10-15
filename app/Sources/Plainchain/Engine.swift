@@ -75,7 +75,7 @@ final class Engine {
         return s
     }
 
-    init(input: Endpoint, output: Endpoint, devices: [Device], stages chain: [Stage]) throws {
+    init(input: Endpoint, output: Endpoint, devices: [Device], stages chain: [Stage], bufferFrames: Int = 0) throws {
         effects = chain.map(\.unit)
         stageCount = chain.count + 1
         stages = .allocate(capacity: stageCount)
@@ -85,7 +85,7 @@ final class Engine {
         }
         hal = try Engine.newHAL()
         do {
-            try build(input: input, output: output, devices: devices, bypass: chain.map(\.bypass))
+            try build(input: input, output: output, devices: devices, bypass: chain.map(\.bypass), bufferFrames: bufferFrames)
         } catch {
             teardown()
             throw error
@@ -130,7 +130,7 @@ final class Engine {
         return unit!
     }
 
-    private func build(input: Endpoint, output: Endpoint, devices: [Device], bypass: [Bool]) throws {
+    private func build(input: Endpoint, output: Endpoint, devices: [Device], bypass: [Bool], bufferFrames: Int) throws {
         guard !input.channels.isEmpty else { throw EngineError("choose at least one input channel") }
         guard input.channels.count <= Engine.maxChannels else { throw EngineError("at most \(Engine.maxChannels) input channels") }
         guard !output.channels.isEmpty else { throw EngineError("choose at least one output channel") }
@@ -153,6 +153,7 @@ final class Engine {
             deviceName = "\(inDev.name) → \(outDev.name)"
         }
         self.device = device
+        if bufferFrames > 0 { try? HAL.setBufferSize(device, bufferFrames) }
         sampleRate = try HAL.sampleRate(device)
         width = input.channels.count
         for i in 0..<stageCount { stages[i].width = width }
