@@ -5,10 +5,10 @@ BUNDLE  := $(BUILD)/$(APP).app
 BIN     := app/.build/release/$(APP)
 ICON    := $(BUILD)/AppIcon.icns
 ICONSRC := app/Assets/icon-1024.png
-# A real signing identity keeps the microphone permission across rebuilds; ad-hoc ("-") does not.
+# Signing identity from the environment (export DEVELOPER_ID_APPLICATION="Developer ID Application: ..."),
+# falling back to ad-hoc, which works locally but loses the microphone permission on every rebuild.
 # Hardened runtime, with entitlements that let third-party plugins load in-process.
-SIGN    ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1)
-SIGN    := $(if $(SIGN),$(SIGN),-)
+SIGN    := $(if $(DEVELOPER_ID_APPLICATION),"$(DEVELOPER_ID_APPLICATION)",-)
 PROFILE ?= plainchain
 
 .PHONY: all app bundle run install smoke clean icon notarize dist

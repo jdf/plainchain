@@ -42,7 +42,7 @@ Requires Xcode (Swift 6) and Homebrew's `capnp` (`brew install capnp`) for its s
 make dist       # sign, notarize (waits for Apple), staple, zip -> build/Plainchain.zip
 ```
 
-Needs a notarytool keychain profile, created once with `xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team>`. The Makefile picks the first Developer ID certificate in your keychain and the profile named `plainchain`; override with `make dist SIGN="Developer ID Application: ..." PROFILE=<profile>`.
+Needs a notarytool keychain profile, created once with `xcrun notarytool store-credentials <profile> --apple-id <id> --team-id <team>`. Signing uses the identity in the `DEVELOPER_ID_APPLICATION` environment variable (set it in your shell profile); without it builds are ad-hoc signed, which runs locally but cannot be notarized. The notary profile defaults to `plainchain`; override with `make dist PROFILE=<profile>`.
 
 ## How the engine works
 
