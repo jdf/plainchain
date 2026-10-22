@@ -35,20 +35,34 @@ final class Model: ObservableObject {
     /// Read-only meter parameters that report gain reduction, where a plugin has one.
     private var reductionMeters: [UUID: Plugins.ReductionMeter] = [:]
     private var editors: [UUID: EditorWindow] = [:]
-    private var engine: Engine?
+    private var engine: Engine? { didSet { if engine !== oldValue { aliveListeners = [] } } }
     private var restartTask: Task<Void, Never>?
     private var autosaveTask: Task<Void, Never>?
+    /// The engine is down only because a session device is missing, and comes back when it returns.
+    private var awaitingDevice = false
+    /// Every device name seen since launch, by UID, for naming one that is gone.
+    private var deviceNames: [String: String] = [:]
+    /// HAL listeners for the device list and the system defaults.
+    private var deviceListeners: [HAL.Listener] = []
+    /// `DeviceIsAlive` listeners on the running engine's devices; dropped with the engine.
+    private var aliveListeners: [HAL.Listener] = []
+    /// A session load is swapping plugins and session; device changes wait for it.
+    private var loading = false
 
     private static let sessionPathKey = "sessionPath"
+    /// Touches neither UserDefaults nor the autosave file: no restore at launch, no autosave (for headless tests).
+    private let ephemeral: Bool
 
     var title: String {
         let name = sessionURL?.deletingPathExtension().lastPathComponent ?? "Untitled"
         return dirty ? "\(name) — Edited" : name
     }
 
-    init() {
-        let devices = (try? HAL.devices()) ?? []
+    init(ephemeral: Bool = false) {
+        self.ephemeral = ephemeral
+        let devices = (try? Self.scanDevices()) ?? []
         self.devices = devices
+        for d in devices { deviceNames[d.uid] = d.name }
         plugins = Plugins.installed()
         session = Self.defaultSession(devices)
         enabled = true  // the engine runs from launch; the Run switch is for pausing
@@ -57,10 +71,15 @@ final class Model: ObservableObject {
         NotificationCenter.default.addObserver(forName: Notification.Name(kAudioComponentRegistrationsChangedNotification as String), object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.refreshPlugins() }
         }
+        // The HAL tells us when devices come and go, and when the system defaults change.
+        let sys = AudioObjectID(kAudioObjectSystemObject)
+        deviceListeners = [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice].compactMap {
+            try? HAL.listen(sys, $0) { [weak self] in Task { @MainActor in self?.refreshDevices() } }
+        }
         Task {
-            if let path = UserDefaults.standard.string(forKey: Self.sessionPathKey), FileManager.default.fileExists(atPath: path) {
+            if !ephemeral, let path = UserDefaults.standard.string(forKey: Self.sessionPathKey), FileManager.default.fileExists(atPath: path) {
                 await open(URL(fileURLWithPath: path), quietly: true)
-            } else if let saved = try? SessionFile.read(SessionFile.autosaveURL) {
+            } else if !ephemeral, let saved = try? SessionFile.read(SessionFile.autosaveURL) {
                 await load(saved, from: nil)
             }
             await poll()
@@ -182,8 +201,69 @@ final class Model: ObservableObject {
         }
     }
 
+    /// The HAL's devices, less this process's own private aggregates.
+    private static func scanDevices() throws -> [Device] {
+        try HAL.devices().filter { !$0.uid.hasPrefix(HAL.aggregatePrefix) }
+    }
+
     func refreshDevices() {
-        if let d = try? HAL.devices(), d != devices { devices = d }
+        guard let d = try? Self.scanDevices() else { return }
+        for x in d { deviceNames[x.uid] = x.name }
+        guard d != devices else { return }
+        devices = d
+        reconcileDevices()
+    }
+
+    private var inputName: String { deviceNames[session.input.deviceUid] ?? "input device" }
+    private var outputName: String { deviceNames[session.output.deviceUid] ?? "output device" }
+
+    /// The name of a session device that is not connected, if any.
+    private var missingDevice: String? {
+        if device(uid: session.input.deviceUid) == nil { return inputName }
+        if device(uid: session.output.deviceUid) == nil { return outputName }
+        return nil
+    }
+
+    /// Engine down until `name` is back.
+    private func awaitDevice(_ name: String) {
+        engine = nil
+        awaitingDevice = true
+        status.running = false
+        error = "Waiting for \(name)…"
+    }
+
+    /// After a device-list change: drop an engine whose devices went away (or
+    /// went and came back with new ids), and restart one that was waiting for
+    /// them. Nothing else restarts the engine here, so a graph that fails to
+    /// build for other reasons is not retried on every device change.
+    private func reconcileDevices() {
+        guard !loading else { return }  // `load` restarts on its own when it is done
+        if let engine {
+            if device(uid: session.input.deviceUid)?.id != engine.inputDevice {
+                awaitDevice(inputName)
+            } else if device(uid: session.output.deviceUid)?.id != engine.outputDevice {
+                awaitDevice(outputName)
+            }
+        }
+        if enabled && awaitingDevice && missingDevice == nil { scheduleRestart() }
+    }
+
+    /// Watch the engine's devices directly, so a device that dies and comes
+    /// back under the same object id is still noticed.
+    private func watchEngineDevices() {
+        guard let engine else { return }
+        aliveListeners = Set([engine.inputDevice, engine.outputDevice]).compactMap { id in
+            try? HAL.listen(id, kAudioDevicePropertyDeviceIsAlive) { [weak self] in Task { @MainActor in self?.aliveChanged(id) } }
+        }
+    }
+
+    private func aliveChanged(_ id: AudioObjectID) {
+        guard let engine, id == engine.inputDevice || id == engine.outputDevice else { return }
+        let alive: UInt32 = (try? HAL.get(id, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, UInt32(0))) ?? 0
+        guard alive == 0 else { return }
+        awaitDevice(id == engine.inputDevice ? inputName : outputName)
+        refreshDevices()
+        reconcileDevices()
     }
 
     /// Re-read the installed Audio Units from the system registry.
@@ -215,6 +295,7 @@ final class Model: ObservableObject {
     }
 
     func autosave() {
+        guard !ephemeral else { return }
         try? SessionFile.write(snapshot(), to: SessionFile.autosaveURL)
     }
 
@@ -255,7 +336,7 @@ final class Model: ObservableObject {
             try SessionFile.write(snapshot(), to: url)
             sessionURL = url
             dirty = false
-            UserDefaults.standard.set(url.path, forKey: Self.sessionPathKey)
+            if !ephemeral { UserDefaults.standard.set(url.path, forKey: Self.sessionPathKey) }
         } catch {
             self.error = "could not save: \(error.localizedDescription)"
         }
@@ -264,9 +345,11 @@ final class Model: ObservableObject {
     /// Replace everything: stop, drop old plugins, instantiate the new chain with its saved state.
     private func load(_ incoming: Session, from url: URL?) async {
         busy = true
-        defer { busy = false }
+        loading = true
+        defer { busy = false; loading = false }
         restartTask?.cancel()
         engine = nil
+        status.running = false
         for w in editors.values { w.close() }
         editors = [:]
         instances = [:]
@@ -295,7 +378,9 @@ final class Model: ObservableObject {
         sessionURL = url
         dirty = false
         error = failures.isEmpty ? nil : "could not load: " + failures.joined(separator: ", ")
-        if let url { UserDefaults.standard.set(url.path, forKey: Self.sessionPathKey) } else { UserDefaults.standard.removeObject(forKey: Self.sessionPathKey) }
+        if !ephemeral {
+            if let url { UserDefaults.standard.set(url.path, forKey: Self.sessionPathKey) } else { UserDefaults.standard.removeObject(forKey: Self.sessionPathKey) }
+        }
         if enabled { scheduleRestart() }
     }
 
@@ -313,14 +398,20 @@ final class Model: ObservableObject {
 
     private func restart() {
         engine = nil
+        if let missing = missingDevice { awaitDevice(missing); return }
+        // A failed recovery build (device still settling) stays armed for the next device change.
+        let recovering = awaitingDevice
+        awaitingDevice = false
         let units = session.chain.compactMap { instances[$0.id]?.audioUnit }
         guard units.count == session.chain.count else { return }
         do {
             let stages = zip(units, session.chain).map { Engine.Stage(unit: $0, bypass: $1.bypass, gainDb: $1.inputGainDb) }
             engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
             error = nil
+            watchEngineDevices()
         } catch {
             self.error = error.localizedDescription
+            awaitingDevice = recovering
         }
         if let engine { status = engine.status } else { status.running = false }
     }
@@ -328,6 +419,7 @@ final class Model: ObservableObject {
     private func stop() {
         restartTask?.cancel()
         engine = nil
+        awaitingDevice = false
         status.running = false  // keep the last readings so the status bar stays put, just grayed
         error = nil
     }
@@ -345,7 +437,7 @@ final class Model: ObservableObject {
             pollLevels()
             if tick % 20 == 0 {
                 if let engine { status = engine.status }
-                refreshDevices()
+                refreshDevices()  // fallback for missed notifications and rate or channel changes
             }
         }
     }

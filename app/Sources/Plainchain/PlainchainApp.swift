@@ -4,7 +4,13 @@ import SwiftUI
 @main
 enum Main {
     static func main() {
-        if CommandLine.arguments.contains("--smoke") { Smoke.run() } else { PlainchainApp.main() }
+        if CommandLine.arguments.contains("--smoke") {
+            Smoke.run()
+        } else if CommandLine.arguments.contains("--hotplug-test") {
+            MainActor.assumeIsolated { HotplugTest.run() }
+        } else {
+            PlainchainApp.main()
+        }
     }
 }
 

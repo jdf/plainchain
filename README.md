@@ -26,6 +26,8 @@ Sessions (devices, chain, and every plugin's state) save to `.plainchain` files:
 | `app/Sources/Plainchain/Editors.swift` | Plugin editor windows. |
 | `app/Sources/Plainchain/ContentView.swift` | The one window. |
 | `app/Sources/Plainchain/Smoke.swift` | Headless engine check (`--smoke`). |
+| `app/Sources/Plainchain/HotplugTest.swift` | Headless device hot-plug check (`--hotplug-test`), run in the test VM. |
+| `tools/testvm.sh` | Runs things in the Tart test VM: `push` the bundle, `run` a command, `hotplug`. |
 | `Makefile` | Builds and assembles `build/Plainchain.app`. |
 
 ## Build and run
@@ -33,6 +35,7 @@ Sessions (devices, chain, and every plugin's state) save to `.plainchain` files:
 ```sh
 make run        # swift build, bundle, open
 make smoke      # headless: default in -> out for 2 s, then a session round trip
+make hotplug-test  # headless, in the Tart test VM: unplug and replug a fake interface under a running session
 PC_IN="Loopback" PC_OUT="MacBook Air Speakers" make smoke PLUGINS="AUDelay AUGraphicEQ"
 ```
 
@@ -49,6 +52,10 @@ Needs a notarytool keychain profile, created once with `xcrun notarytool store-c
 ## How the engine works
 
 One CoreAudio HAL output unit handles both input (bus 1) and output (bus 0). When the chosen input and output are the same device, it is used directly. When they differ, the app creates a private aggregate device of the two, with the output device as clock master and drift compensation on the input, so CoreAudio handles clock drift and differing sample rates. The aggregate is destroyed when the graph is torn down.
+
+The app listens for HAL device-list changes. When a session device disappears, or comes back under a new object id, the graph is torn down and the app shows "Waiting for …"; when both session devices are present again the graph is rebuilt on its own. The app's own private aggregates are left out of the device list, so creating one never counts as a change.
+
+`make hotplug-test` checks this headlessly in the Tart test VM (`tools/testvm.sh`; never on the host, where it would route the live microphone to the speakers). It fakes an audio interface with a public aggregate device under a fixed UID wrapping the guest's virtual sound device, then unplugs it (destroys the aggregate) and replugs it (recreates it under a new object id) beneath a running session, and checks the "Waiting for …" teardown, the unattended rebuild, and that nothing restarts afterwards. The test runs in the guest's GUI (Aqua) session, because over plain ssh TCC judges the microphone request against sshd rather than the app; the guest also needs a microphone grant for `com.plainchain.app` in its TCC database, or every HAL call hangs.
 
 Effects are wired with `kAudioUnitProperty_MakeConnection`. The first effect's render callback pulls the current IO cycle's input straight from the HAL unit into the effect's own buffers, so there is no intermediate buffer and no added latency beyond the device's own.
 

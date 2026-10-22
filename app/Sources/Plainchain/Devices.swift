@@ -93,12 +93,15 @@ enum HAL {
         try check(AudioObjectSetPropertyData(device, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value), "set buffer size")
     }
 
+    /// UID prefix of the private aggregates this app creates.
+    static let aggregatePrefix = "com.plainchain.aggregate."
+
     /// A private aggregate of two devices, with the output device as the clock
     /// master and drift compensation on the input. Returns the new device id.
     static func createAggregate(input: Device, output: Device) throws -> AudioObjectID {
         let description: [String: Any] = [
             "name": "Plainchain (\(input.name) → \(output.name))",
-            "uid": "com.plainchain.aggregate." + UUID().uuidString,
+            "uid": aggregatePrefix + UUID().uuidString,
             "private": 1,
             "stacked": 0,
             "master": output.uid,
@@ -114,5 +117,26 @@ enum HAL {
 
     static func destroyAggregate(_ id: AudioObjectID) {
         AudioHardwareDestroyAggregateDevice(id)
+    }
+
+    /// A property listener on a HAL object; removed when this is released.
+    final class Listener {
+        private let object: AudioObjectID
+        private var addr: AudioObjectPropertyAddress
+        private let block: AudioObjectPropertyListenerBlock
+
+        fileprivate init(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ handler: @escaping () -> Void) throws {
+            self.object = object
+            addr = HAL.address(selector)
+            block = { _, _ in handler() }
+            try check(AudioObjectAddPropertyListenerBlock(object, &addr, .main, block), "listen \(FourCC.string(selector))")
+        }
+
+        deinit { AudioObjectRemovePropertyListenerBlock(object, &addr, .main, block) }
+    }
+
+    /// Call `handler` on the main queue whenever `selector` (global scope) of `object` changes.
+    static func listen(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ handler: @escaping () -> Void) throws -> Listener {
+        try Listener(object, selector, handler)
     }
 }

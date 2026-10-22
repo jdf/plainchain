@@ -11,7 +11,7 @@ ICONSRC := app/Assets/icon-1024.png
 SIGN    := $(if $(DEVELOPER_ID_APPLICATION),"$(DEVELOPER_ID_APPLICATION)",-)
 PROFILE ?= plainchain
 
-.PHONY: all app bundle run install smoke clean icon notarize dist
+.PHONY: all app bundle run install smoke hotplug-test clean icon notarize dist
 
 all: bundle
 
@@ -67,6 +67,12 @@ dist: notarize
 # PC_IN / PC_OUT select devices by name substring; PLUGINS lists plugin names.
 smoke: bundle
 	"$(BUNDLE)/Contents/MacOS/$(APP)" --smoke $(PLUGINS)
+
+# Device hot-plug recovery, in the Tart test VM (never on the host): a fake
+# interface (a public aggregate under a fixed UID) is unplugged and replugged
+# under a running session. tools/testvm.sh up/down manage the guest.
+hotplug-test: bundle
+	tools/testvm.sh hotplug
 
 clean:
 	rm -rf app/.build "$(BUILD)"

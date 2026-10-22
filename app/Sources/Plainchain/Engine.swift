@@ -71,6 +71,9 @@ final class Engine {
     private var latency = Status()
     /// The HAL device the graph runs on (a real device or the private aggregate).
     private(set) var device: AudioObjectID = 0
+    /// The real input and output devices behind `device`, as they were when the graph was built.
+    private(set) var inputDevice: AudioObjectID = 0
+    private(set) var outputDevice: AudioObjectID = 0
     private(set) var bufferSizeChoices: [Int] = []
 
     var status: Status {
@@ -173,6 +176,9 @@ final class Engine {
         if let ch = input.channels.first(where: { $0 >= inDev.inputChannels }) { throw EngineError("\(inDev.name) has no input channel \(ch + 1)") }
         if let ch = output.channels.first(where: { $0 >= outDev.outputChannels }) { throw EngineError("\(outDev.name) has no output channel \(ch + 1)") }
 
+        inputDevice = inDev.id
+        outputDevice = outDev.id
+
         // ---- Device: the device itself, or a private aggregate of the two.
         let device: AudioObjectID
         var outputOffset: UInt32 = 0
@@ -200,6 +206,11 @@ final class Engine {
         stages[stageCount - 1].allStages = stages
         stages[stageCount - 1].stageCount = stageCount
         let deviceOutputs = try HAL.channelCount(device, kAudioObjectPropertyScopeOutput)
+        // A fresh aggregate can report fewer channels than its sub-devices for a moment,
+        // for example while a sub-device that just reappeared is still joining it.
+        if let ch = output.channels.max(), outputOffset + ch >= deviceOutputs {
+            throw EngineError("\(deviceName) has \(deviceOutputs) output channels, not yet \(outputOffset + ch + 1)")
+        }
         var format = AudioStreamBasicDescription(
             mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,

@@ -102,6 +102,41 @@ enum Smoke {
         let back = try SessionFile.read(url)
         print("round trip:", back == saved ? "ok" : "MISMATCH", "state bytes:", back.chain.map { $0.state?.count ?? 0 }, "file:", url.path)
         print("stopped cleanly")
+        if env["PC_LISTEN"] != nil { try listen(out) }
+    }
+
+    /// Device-list listener check: create and destroy aggregates and see the
+    /// callback arrive on the main queue. A public one must fire it; a private
+    /// one is reported, along with whether it shows up in our own device list.
+    private static func listen(_ out: Device) throws {
+        var fired = 0
+        let listener = try HAL.listen(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDevices) {
+            precondition(Thread.isMainThread, "listener called off the main thread")
+            fired += 1
+        }
+        let description: [String: Any] = [
+            "name": "Plainchain smoke",
+            "uid": "com.plainchain.smoke." + UUID().uuidString,
+            "private": 0,
+            "subdevices": [["uid": out.uid]],
+        ]
+        var id: AudioObjectID = 0
+        try check(AudioHardwareCreateAggregateDevice(description as CFDictionary, &id), "create public aggregate")
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        let created = fired
+        AudioHardwareDestroyAggregateDevice(id)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        print("listener: public aggregate create fired \(created), destroy fired \(fired - created)")
+
+        let before = fired
+        let priv = try HAL.createAggregate(input: out, output: out)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        let listed = try HAL.devices().contains { $0.uid.hasPrefix(HAL.aggregatePrefix) }
+        HAL.destroyAggregate(priv)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        print("listener: private aggregate fired \(fired - before), in our device list: \(listed)")
+        _ = listener
+        guard created > 0 else { throw EngineError("device-list listener never fired") }
     }
 
     /// Block the main thread on an async call while servicing the run loop.
