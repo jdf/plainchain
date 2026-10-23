@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -16,14 +17,17 @@ final class Levels: ObservableObject {
     @Published var midiActive = false
 }
 
-/// All app state. Session edits are autosaved and, when the engine is
-/// enabled, pushed to the engine (bypass live; anything else rebuilds the graph).
+/// One session window's state: its session, engine, plugin instances, and
+/// editors. Session edits are autosaved and, when the engine is enabled,
+/// pushed to the engine (bypass live; anything else rebuilds the graph).
 /// Plugin instances live here and survive graph rebuilds, so reordering the
-/// chain or switching devices keeps every plugin's settings.
+/// chain or switching devices keeps every plugin's settings. What windows
+/// share (devices, plugins, MIDI sources) lives in `AppState`.
 @MainActor
 final class Model: ObservableObject {
-    @Published private(set) var devices: [Device] = []
-    @Published private(set) var plugins: [Plugin] = []
+    let app: AppState
+    /// The window's session identity; also names its autosave file.
+    let id: UUID
     @Published private(set) var session: Session
     @Published var enabled: Bool { didSet { enabled ? scheduleRestart() : stop() } }
     @Published private(set) var status = Engine.Status()
@@ -33,10 +37,24 @@ final class Model: ObservableObject {
     @Published private(set) var sessionURL: URL?
     @Published private(set) var dirty = false
     @Published private(set) var busy = false
-    @Published private(set) var midiSources: [MidiSource] = []
     let levels = Levels()
     /// MIDI input; its rings feed the engine in MIDI mode, and it costs nothing otherwise.
-    let midi = MidiInput()
+    let midi: MidiInput
+    /// The window showing this session, once it is on screen.
+    private(set) weak var window: NSWindow?
+    private var closeGuard: WindowCloseGuard?
+    /// The window was closed on purpose and everything is shut down.
+    private(set) var closed = false
+    /// The file the window was opened with, until a load resolves it; the restore list keeps it meanwhile.
+    private var requestedPath: String?
+    /// The session as created, before any restore or edit: `isPristine` compares against it,
+    /// not the current system defaults, so plugging in headphones does not make a window "touched".
+    private let initialSession: Session
+    /// The session and plugin states as last loaded from or saved to `sessionURL`;
+    /// nil when there is no such baseline (untitled, or restored with unsaved edits).
+    private var savedBaseline: (session: Session, states: [UUID: NSDictionary])?
+    /// A load problem to keep showing once the engine is up (the rebuild otherwise clears `error`).
+    private var loadNotice: String?
     private var midiReceived: UInt32 = 0
     private var midiQuietTicks = 0
 
@@ -51,19 +69,18 @@ final class Model: ObservableObject {
     }
     private var restartTask: Task<Void, Never>?
     private var autosaveTask: Task<Void, Never>?
+    private var pollTask: Task<Void, Never>?
+    /// Loading the session the window was opened with.
+    private var restoreTask: Task<Void, Never>?
+    private var appWatch: AnyCancellable?
     /// The engine is down only because a session device is missing, and comes back when it returns.
     private var awaitingDevice = false
-    /// Every device name seen since launch, by UID, for naming one that is gone.
-    private var deviceNames: [String: String] = [:]
-    /// HAL listeners for the device list and the system defaults.
-    private var deviceListeners: [HAL.Listener] = []
     /// `DeviceIsAlive` listeners on the running engine's devices; dropped with the engine.
     private var aliveListeners: [HAL.Listener] = []
     /// A session load is swapping plugins and session; device changes wait for it.
     private var loading = false
 
-    private static let sessionPathKey = "sessionPath"
-    /// Touches neither UserDefaults nor the autosave file: no restore at launch, no autosave (for headless tests).
+    /// Touches no autosave file: no restore, no autosave (for headless tests).
     private let ephemeral: Bool
 
     var title: String {
@@ -71,35 +88,56 @@ final class Model: ObservableObject {
         return dirty ? "\(name) — Edited" : name
     }
 
-    init(ephemeral: Bool = false) {
+    /// A session window's model: `ref.path` is the session file, or nil for
+    /// an untitled session. Either way an autosave under `ref.id`, if there is
+    /// one, holds the latest state and wins.
+    init(app: AppState, ref: SessionRef = SessionRef(), ephemeral: Bool = false) {
+        self.app = app
+        self.id = ref.id
         self.ephemeral = ephemeral
-        let devices = (try? Self.scanDevices()) ?? []
-        self.devices = devices
-        for d in devices { deviceNames[d.uid] = d.name }
-        plugins = Plugins.installed()
-        midiSources = midi.sources
-        session = Self.defaultSession(devices)
+        midi = MidiInput(system: app.midi)
+        let fresh = Self.defaultSession(app.devices)
+        session = fresh
+        initialSession = fresh
+        requestedPath = ref.path
         enabled = true  // the engine runs from launch; the Run switch is for pausing
-        AVCaptureDevice.requestAccess(for: .audio) { _ in }
-        // macOS registers newly installed Audio Units on its own; it tells us when the set changes.
-        NotificationCenter.default.addObserver(forName: Notification.Name(kAudioComponentRegistrationsChangedNotification as String), object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.refreshPlugins() }
-        }
-        // The HAL tells us when devices come and go, and when the system defaults change.
-        let sys = AudioObjectID(kAudioObjectSystemObject)
-        deviceListeners = [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice].compactMap {
-            try? HAL.listen(sys, $0) { [weak self] in Task { @MainActor in self?.refreshDevices() } }
-        }
-        midi.onSourcesChanged = { [weak self] s in MainActor.assumeIsolated { self?.midiSources = s } }
-        Task {
-            if !ephemeral, let path = UserDefaults.standard.string(forKey: Self.sessionPathKey), FileManager.default.fileExists(atPath: path) {
-                await open(URL(fileURLWithPath: path), quietly: true)
-            } else if !ephemeral, let saved = try? SessionFile.read(SessionFile.autosaveURL) {
-                await load(saved, from: nil)
+        // The views watch this model; shared lists changing redraw them too.
+        appWatch = app.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+        app.register(self)
+        restoreTask = Task {
+            guard !ephemeral else { return }
+            let file = ref.path.map { URL(fileURLWithPath: $0) }
+            if let saved = try? SessionFile.read(SessionFile.autosaveURL(for: ref.id)) {
+                await load(saved, from: file)
+                guard !Task.isCancelled, !closed else { return }
+                if file != nil { dirty = true; savedBaseline = nil }  // a titled session's autosave holds edits not yet saved
+            } else if let file {
+                await open(file, quietly: false)
+                guard !Task.isCancelled, !closed else { return }
+                // The file could not be read: run the default session, with the error kept in view.
+                if sessionURL == nil, enabled { loadNotice = error; scheduleRestart() }
+            } else if enabled {
+                scheduleRestart()  // a new untitled session runs on the default devices right away
             }
-            await poll()
+        }
+        pollTask = Task { [weak self] in
+            var tick = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(50))
+                guard let self else { return }
+                tick += 1
+                pollLevels()
+                if tick % 20 == 0, let engine { status = engine.status }  // picks up buffer size changes from other windows
+            }
         }
     }
+
+    /// For the restore list and window value. Until the window's file has
+    /// loaded (or while it failed to and the window is untouched), the file it was opened with.
+    var ref: SessionRef { SessionRef(id: id, path: sessionURL?.path ?? requestedPath) }
+
+    /// Wait for the session the window opened with to finish loading.
+    func restored() async { await restoreTask?.value }
 
     private static func defaultSession(_ devices: [Device]) -> Session {
         let inp = devices.first { $0.defaultInput } ?? devices.first { $0.inputChannels > 0 }
@@ -112,6 +150,9 @@ final class Model: ObservableObject {
 
     // MARK: Lookups
 
+    var devices: [Device] { app.devices }
+    var plugins: [Plugin] { app.plugins }
+    var midiSources: [MidiSource] { app.midiSources }
     var inputDevices: [Device] { devices.filter { $0.inputChannels > 0 } }
     var outputDevices: [Device] { devices.filter { $0.outputChannels > 0 } }
     func device(uid: String) -> Device? { devices.first { $0.uid == uid } }
@@ -181,7 +222,9 @@ final class Model: ObservableObject {
             do {
                 if plugin.isInstrument, hasInstrument { throw EngineError("the chain already has an instrument") }
                 let item = ChainItem(plugin: plugin.id)
-                register(try await Plugins.instantiate(plugin.id), for: item.id)
+                let unit = try await Plugins.instantiate(plugin.id)
+                guard !closed else { return }
+                register(unit, for: item.id)
                 update { s in
                     guard plugin.isInstrument else { s.chain.append(item); return }
                     // An instrument heads the chain and needs MIDI input.
@@ -190,6 +233,7 @@ final class Model: ObservableObject {
                 }
                 // Some plugins only offer their view once initialized, so wait for the rebuild.
                 await restartTask?.value
+                guard !closed else { return }
                 openEditor(item)
             } catch {
                 self.error = "\(plugin.name): \(error.localizedDescription)"
@@ -223,6 +267,7 @@ final class Model: ObservableObject {
 
     /// Open the plugin's editor, or bring it forward if it is already open.
     func openEditor(_ item: ChainItem) {
+        guard !closed else { return }
         if let w = editors[item.id] { w.makeKeyAndOrderFront(nil); return }
         guard let unit = instances[item.id] else { return }
         EditorWindow.open(for: unit, title: name(of: item.plugin)) { [weak self] window in
@@ -247,21 +292,8 @@ final class Model: ObservableObject {
         }
     }
 
-    /// The HAL's devices, less this process's own private aggregates.
-    private static func scanDevices() throws -> [Device] {
-        try HAL.devices().filter { !$0.uid.hasPrefix(HAL.aggregatePrefix) }
-    }
-
-    func refreshDevices() {
-        guard let d = try? Self.scanDevices() else { return }
-        for x in d { deviceNames[x.uid] = x.name }
-        guard d != devices else { return }
-        devices = d
-        reconcileDevices()
-    }
-
-    private var inputName: String { deviceNames[session.input.deviceUid] ?? "input device" }
-    private var outputName: String { deviceNames[session.output.deviceUid] ?? "output device" }
+    private var inputName: String { app.deviceNames[session.input.deviceUid] ?? "input device" }
+    private var outputName: String { app.deviceNames[session.output.deviceUid] ?? "output device" }
 
     /// The name of a session device that is not connected, if any. A MIDI input has no device.
     private var missingDevice: String? {
@@ -282,8 +314,8 @@ final class Model: ObservableObject {
     /// went and came back with new ids), and restart one that was waiting for
     /// them. Nothing else restarts the engine here, so a graph that fails to
     /// build for other reasons is not retried on every device change.
-    private func reconcileDevices() {
-        guard !loading else { return }  // `load` restarts on its own when it is done
+    func devicesChanged() {
+        guard !loading, !closed else { return }  // `load` restarts on its own when it is done
         if let engine {
             if !isMidi, device(uid: session.input.deviceUid)?.id != engine.inputDevice {
                 awaitDevice(inputName)
@@ -308,15 +340,12 @@ final class Model: ObservableObject {
         let alive: UInt32 = (try? HAL.get(id, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, UInt32(0))) ?? 0
         guard alive == 0 else { return }
         awaitDevice(id == engine.outputDevice ? outputName : inputName)
-        refreshDevices()
-        reconcileDevices()
+        app.refreshDevices()
+        devicesChanged()
     }
 
     /// Re-read the installed Audio Units from the system registry.
-    func refreshPlugins() {
-        let p = Plugins.installed()
-        if p != plugins { plugins = p }
-    }
+    func refreshPlugins() { app.refreshPlugins() }
 
     // MARK: Sessions
 
@@ -332,6 +361,9 @@ final class Model: ObservableObject {
 
     private func markDirty() {
         dirty = true
+        loadNotice = nil
+        // An untitled window whose file failed to load becomes its own session once edited.
+        if sessionURL == nil { requestedPath = nil }
         autosaveTask?.cancel()
         autosaveTask = Task {
             try? await Task.sleep(for: .seconds(2))
@@ -340,51 +372,95 @@ final class Model: ObservableObject {
         }
     }
 
+    /// An untitled session is always autosaved; a titled one only while it
+    /// has unsaved edits (its file holds the rest), so quitting never loses them.
     func autosave() {
+        guard !ephemeral, !closed else { return }
+        if sessionURL != nil && !hasUnsavedChanges { discardAutosave(); return }
+        try? SessionFile.write(snapshot(), to: SessionFile.autosaveURL(for: id))
+    }
+
+    /// Every plugin's current state, for comparing with the saved baseline.
+    private func pluginStates() -> [UUID: NSDictionary] {
+        var states: [UUID: NSDictionary] = [:]
+        for item in session.chain {
+            if let state = instances[item.id]?.auAudioUnit.fullState { states[item.id] = state as NSDictionary }
+        }
+        return states
+    }
+
+    private func recordBaseline() {
+        savedBaseline = (session, pluginStates())
+    }
+
+    /// The titled session differs from its file: session edits (`dirty`), or
+    /// plugin settings changed in an editor, which never mark the session dirty.
+    var hasUnsavedChanges: Bool {
+        guard sessionURL != nil else { return false }
+        guard !dirty, let base = savedBaseline, base.session == session else { return true }
+        return base.states != pluginStates()
+    }
+
+    private func discardAutosave() {
         guard !ephemeral else { return }
-        try? SessionFile.write(snapshot(), to: SessionFile.autosaveURL)
+        try? FileManager.default.removeItem(at: SessionFile.autosaveURL(for: id))
     }
 
-    func newSession() {
-        Task { await load(Self.defaultSession(devices), from: nil) }
+    /// Untitled and untouched: nothing in the chain and the default devices.
+    /// A file opened from the key window loads into such a window instead of a new one.
+    var isPristine: Bool {
+        sessionURL == nil && requestedPath == nil && !loading && session.chain.isEmpty
+            && session.input == initialSession.input && session.output == initialSession.output
     }
 
-    func openSession() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: SessionFile.fileExtension) ?? .json]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { await open(url, quietly: false) }
-    }
+    /// Closing would lose something: an untitled session with anything in it, or a titled one with unsaved changes.
+    var needsSavePrompt: Bool { sessionURL == nil ? !isPristine : hasUnsavedChanges }
 
     func open(_ url: URL, quietly: Bool) async {
         do {
             let s = try SessionFile.read(url)
             await load(s, from: url)
+            discardAutosave()
         } catch {
             if !quietly { self.error = "could not open \(url.lastPathComponent): \(error.localizedDescription)" }
         }
     }
 
-    func saveSession() {
-        if let url = sessionURL { save(to: url) } else { saveSessionAs() }
+    /// Whether the session was saved (false when the save panel was cancelled or the write failed).
+    @discardableResult
+    func saveSession() -> Bool {
+        if let url = sessionURL { return save(to: url) } else { return saveSessionAs() }
     }
 
-    func saveSessionAs() {
+    @discardableResult
+    func saveSessionAs() -> Bool {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [UTType(filenameExtension: SessionFile.fileExtension) ?? .json]
         panel.nameFieldStringValue = (sessionURL?.deletingPathExtension().lastPathComponent ?? "Untitled") + "." + SessionFile.fileExtension
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        save(to: url)
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+        // One window per file: two windows saving over each other would lose one's work.
+        let path = url.standardizedFileURL.path
+        if let other = app.liveModels.first(where: { $0 !== self && $0.ref.path.map { URL(fileURLWithPath: $0).standardizedFileURL.path } == path }) {
+            error = "could not save: “\(url.lastPathComponent)” is open in another window (\(other.title))"
+            return false
+        }
+        return save(to: url)
     }
 
-    private func save(to url: URL) {
+    private func save(to url: URL) -> Bool {
         do {
             try SessionFile.write(snapshot(), to: url)
             sessionURL = url
+            requestedPath = nil
             dirty = false
-            if !ephemeral { UserDefaults.standard.set(url.path, forKey: Self.sessionPathKey) }
+            recordBaseline()
+            autosaveTask?.cancel()
+            discardAutosave()
+            app.writeOpenSessions()
+            return true
         } catch {
             self.error = "could not save: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -393,6 +469,7 @@ final class Model: ObservableObject {
         busy = true
         loading = true
         defer { busy = false; loading = false }
+        guard !closed else { return }
         restartTask?.cancel()
         engine = nil
         status.running = false
@@ -419,14 +496,16 @@ final class Model: ObservableObject {
                 failures.append(name(of: item.plugin))
             }
         }
+        guard !closed else { return }  // the window closed meanwhile; the units die with the model
         s.chain = kept
         session = s
         sessionURL = url
+        requestedPath = nil
         dirty = false
-        error = failures.isEmpty ? nil : "could not load: " + failures.joined(separator: ", ")
-        if !ephemeral {
-            if let url { UserDefaults.standard.set(url.path, forKey: Self.sessionPathKey) } else { UserDefaults.standard.removeObject(forKey: Self.sessionPathKey) }
-        }
+        if url != nil { recordBaseline() } else { savedBaseline = nil }
+        loadNotice = failures.isEmpty ? nil : "could not load: " + failures.joined(separator: ", ")
+        error = loadNotice
+        app.writeOpenSessions()
         if enabled { scheduleRestart() }
     }
 
@@ -443,6 +522,7 @@ final class Model: ObservableObject {
     }
 
     private func restart() {
+        guard !closed else { return }
         engine = nil
         hint = nil
         if let missing = missingDevice { awaitDevice(missing); return }
@@ -460,7 +540,7 @@ final class Model: ObservableObject {
             self.engine = engine
             midi.active = engine.midiRingCount
             midi.connect(session.input.midiSource)
-            error = nil
+            error = loadNotice
             hint = needsInstrument ? "Add an instrument to play MIDI into" : nil
             watchEngineDevices()
         } catch {
@@ -480,22 +560,66 @@ final class Model: ObservableObject {
         error = nil
     }
 
+    /// The app is quitting: autosave and stop, keeping the autosave for the next launch.
     func shutdown() {
         autosave()
         engine = nil
     }
 
-    private func poll() async {
-        var tick = 0
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(50))
-            tick += 1
-            pollLevels()
-            if tick % 20 == 0 {
-                if let engine { status = engine.status }
-                refreshDevices()  // fallback for missed notifications and rate or channel changes
+    /// The window was closed on purpose: stop everything, close the editors,
+    /// and forget the session's autosave and its place in the restore list.
+    func close() {
+        guard !closed else { return }
+        restartTask?.cancel()
+        autosaveTask?.cancel()
+        pollTask?.cancel()
+        restoreTask?.cancel()
+        engine = nil
+        midi.connect("")
+        for w in editors.values { w.close() }
+        editors = [:]
+        closed = true
+        discardAutosave()
+        app.unregister(self)
+    }
+
+    // MARK: Window
+
+    /// The window is on screen: watch it for closing.
+    func attach(_ window: NSWindow) {
+        guard self.window !== window else { return }
+        self.window = window
+        closeGuard = WindowCloseGuard(window: window, model: self)
+    }
+
+    /// Asked by the window before it closes: false while the Save / Don't Save / Cancel sheet decides.
+    fileprivate func windowShouldClose(_ window: NSWindow) -> Bool {
+        guard !app.terminating, needsSavePrompt else { return true }
+        let alert = NSAlert()
+        let name = sessionURL?.deletingPathExtension().lastPathComponent ?? "Untitled"
+        alert.messageText = "Do you want to save the changes made to “\(name)”?"
+        alert.informativeText = "Your changes will be lost if you don’t save them."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Don’t Save").hasDestructiveAction = true
+        alert.beginSheetModal(for: window) { [weak self, weak window] response in
+            guard let self, let window else { return }
+            switch response {
+            case .alertFirstButtonReturn:
+                // The sheet is gone before a save panel comes up.
+                DispatchQueue.main.async { if self.saveSession() { window.close() } }
+            case .alertThirdButtonReturn:
+                window.close()  // close() skips windowShouldClose
+            default:
+                break
             }
         }
+        return false
+    }
+
+    fileprivate func windowWillClose() {
+        guard !app.terminating else { return }  // quitting: keep the session for the next launch
+        close()
     }
 
     private func pollLevels() {
@@ -514,5 +638,56 @@ final class Model: ObservableObject {
             levels.peaks[item.id] = fresh.enumerated().map { c, v in max(v, (c < old.count ? old[c] : 0) * 0.85) }
             if let m = reductionMeters[item.id] { levels.reduction[item.id] = m.value }
         }
+    }
+}
+
+/// Asks the model before its window closes, and tells it when the window
+/// does. SwiftUI owns the window's delegate (and sets it after the content is
+/// in the window), so this stands in front of whatever delegate is set and
+/// forwards everything else to it.
+@MainActor
+private final class WindowCloseGuard: NSObject, NSWindowDelegate {
+    private weak var model: Model?
+    private weak var original: NSWindowDelegate?
+    private var observers: [NSObjectProtocol] = []
+    private var delegateWatch: NSKeyValueObservation?
+
+    init(window: NSWindow, model: Model) {
+        self.model = model
+        super.init()
+        install(on: window)
+        delegateWatch = window.observe(\.delegate) { [weak self] window, _ in
+            MainActor.assumeIsolated { self?.install(on: window) }
+        }
+        observers = [
+            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.model?.windowWillClose() }
+            },
+            NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { if let model = self?.model { model.app.sessionBecameKey(model) } }
+            },
+        ]
+        if window.isKeyWindow { model.app.sessionBecameKey(model) }
+    }
+
+    deinit { for o in observers { NotificationCenter.default.removeObserver(o) } }
+
+    private func install(on window: NSWindow) {
+        guard window.delegate !== self else { return }
+        original = window.delegate
+        window.delegate = self
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard model?.windowShouldClose(sender) ?? true else { return false }
+        return original?.windowShouldClose?(sender) ?? true
+    }
+
+    override func responds(to selector: Selector!) -> Bool {
+        super.responds(to: selector) || original?.responds(to: selector) == true
+    }
+
+    override func forwardingTarget(for selector: Selector!) -> Any? {
+        original?.responds(to: selector) == true ? original : super.forwardingTarget(for: selector)
     }
 }

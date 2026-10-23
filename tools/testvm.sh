@@ -6,6 +6,16 @@
 # this script only borrows it. The Plainchain tree is not shared into the
 # guest, so `push` copies the built bundle to ~/Plainchain.app there.
 #
+# Audio stays inside the guest only if it is booted with `--no-audio` (whatis's
+# `up` does that; otherwise its "Apple Virtual Sound Device" passes through to
+# the host's speakers and microphone) and has the BlackHole 16ch loopback
+# driver installed. Every audio run here targets BlackHole by name
+# (PC_IN/PC_OUT, a name substring), never the default devices. BlackHole
+# loops each output channel back into the same input channel, so the tests
+# never write the channels they read: input 1-2, output 3-4 (and 5-6 for a
+# second session). The guest also needs a microphone grant for
+# com.plainchain.app in its TCC database: BlackHole's input counts as a microphone.
+#
 #   tools/testvm.sh status
 #   tools/testvm.sh up | down            (delegated to whatis)
 #   tools/testvm.sh run [--aqua] <cmd...> (ssh into the guest; --aqua runs in the console user's GUI session)
@@ -99,12 +109,12 @@ hotplug)
     push
     # In the console user's Aqua session: over plain ssh the HAL attributes the
     # microphone to sshd, not to Plainchain, and coreaudiod waits on a prompt.
-    run --aqua Plainchain.app/Contents/MacOS/Plainchain --hotplug-test
+    run --aqua /usr/bin/env PC_IN=BlackHole PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --hotplug-test
     ;;
 midi)
     shift
     push
-    run --aqua /usr/bin/env PC_MIDI=1 Plainchain.app/Contents/MacOS/Plainchain --smoke
+    run --aqua /usr/bin/env PC_MIDI=1 PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --smoke
     ;;
 *)
     echo "usage: tools/testvm.sh [status|up|down|push|hotplug|midi|run [--aqua] <command> [args...]]" >&2

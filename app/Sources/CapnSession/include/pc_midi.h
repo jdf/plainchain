@@ -46,6 +46,24 @@ pc_midi_ring *pc_midi_fanout_ring(pc_midi_fanout *f, uint32_t index);
    ring keeps a single producer; consumers never touch the flag. */
 void pc_midi_fanout_push(pc_midi_fanout *f, uint32_t event);
 
+#define PC_MIDI_MAX_FANOUTS 64       /* inputs (session windows) the shared virtual destination reaches */
+
+/* The process's one virtual destination feeds every fanout whose
+   virtual_enabled is set. Fanouts are only ever appended (the UI thread
+   writes the slot, then publishes the count) and never freed, so the
+   producer needs no lock to walk them. */
+typedef struct pc_midi_hub {
+    uint32_t count;
+    pc_midi_fanout *fanouts[PC_MIDI_MAX_FANOUTS];
+} pc_midi_hub;
+
+/* Zeroed; never freed while CoreMIDI may still call a receive block that holds it. */
+pc_midi_hub *pc_midi_hub_new(void);
+/* UI thread: append a fanout; false when the hub is full. */
+bool pc_midi_hub_add(pc_midi_hub *h, pc_midi_fanout *f);
+/* Producer: push one event into every fanout taking the virtual destination. */
+void pc_midi_hub_push(pc_midi_hub *h, uint32_t event);
+
 #ifdef __cplusplus
 }
 #endif

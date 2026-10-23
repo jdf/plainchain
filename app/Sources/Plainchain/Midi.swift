@@ -9,44 +9,114 @@ struct MidiSource: Identifiable, Hashable {
     var id: Int32 { uniqueID }
 }
 
-/// The app's MIDI input: one CoreMIDI client, one input port connected to the
-/// chosen source (or every source), and a virtual destination named
-/// "Plainchain" that other apps can send to, which counts as one more source
-/// under "all sources".
-///
-/// Nothing here calls into an Audio Unit. The receive blocks run on CoreMIDI's
-/// thread and only push packed events into the lock-free rings of `fanout`
-/// (`pc_midi.h`); the engine's render thread drains them into the instrument
-/// and music effects. Use from the main thread.
-final class MidiInput {
+/// The process's CoreMIDI client: the source list, setup-change
+/// notifications, and the one virtual destination named "Plainchain" that
+/// other apps can send to. Its events go to every `MidiInput` listening to
+/// all sources, through the lock-free hub in `pc_midi.h`. Each session
+/// window has its own `MidiInput`, a port on this client. Use from the main thread.
+final class MidiSystem {
     static let destinationName = "Plainchain"
-    static let allSourcesName = "All MIDI Sources"
 
-    /// Allocated once and never freed: CoreMIDI's receive blocks hold it.
-    let fanout: UnsafeMutablePointer<pc_midi_fanout> = pc_midi_fanout_new()
     private(set) var sources: [MidiSource] = []
     /// Called on the main thread when the source list changes.
     var onSourcesChanged: (([MidiSource]) -> Void)?
     /// The virtual destination other apps send to.
     private(set) var destination = MIDIEndpointRef()
-    private var client = MIDIClientRef()
-    private var port = MIDIPortRef()
-    /// "" (none), "*" (all), or a source's unique ID.
-    private var selection = ""
-    private var connected: Set<MIDIEndpointRef> = []
+    fileprivate var client = MIDIClientRef()
+    /// Allocated once and never freed: the destination's receive block holds it.
+    private let hub: UnsafeMutablePointer<pc_midi_hub> = pc_midi_hub_new()
+    /// Fanouts of inputs that went away, for the next one. Never freed (a
+    /// receive block may still be finishing), so they are reused instead.
+    private var spare: [UnsafeMutablePointer<pc_midi_fanout>] = []
+    private var inputs: [WeakInput] = []
+    private struct WeakInput { weak var input: MidiInput? }
 
     init() {
         MIDIClientCreateWithBlock("Plainchain" as CFString, &client) { [weak self] note in
             guard note.pointee.messageID == .msgSetupChanged else { return }
             DispatchQueue.main.async { self?.setupChanged() }
         }
-        MIDIInputPortCreateWithProtocol(client, "Input" as CFString, ._1_0, &port, Self.receiver(fanout, virtual: false))
-        MIDIDestinationCreateWithProtocol(client, Self.destinationName as CFString, ._1_0, &destination, Self.receiver(fanout, virtual: true))
+        MIDIDestinationCreateWithProtocol(client, Self.destinationName as CFString, ._1_0, &destination, MidiInput.receiver(hub: hub))
         sources = Self.scan()
     }
 
-    /// The fanout is left allocated: a receive block may still be finishing.
     deinit { MIDIClientDispose(client) }
+
+    /// A fanout for a new input, reached by the virtual destination (while the
+    /// input enables it) unless more than `PC_MIDI_MAX_FANOUTS` exist at once.
+    fileprivate func takeFanout() -> UnsafeMutablePointer<pc_midi_fanout> {
+        if let f = spare.popLast() { return f }
+        let f = pc_midi_fanout_new()!
+        _ = pc_midi_hub_add(hub, f)
+        return f
+    }
+
+    /// Reconnect `input` whenever the MIDI setup changes.
+    fileprivate func attach(_ input: MidiInput) {
+        inputs.removeAll { $0.input == nil }
+        inputs.append(WeakInput(input: input))
+    }
+
+    /// Called from `MidiInput.deinit`, after its delivery is switched off.
+    fileprivate func detach(_ fanout: UnsafeMutablePointer<pc_midi_fanout>) {
+        spare.append(fanout)
+    }
+
+    /// Sources came or went: refresh the list and reconnect every input, so a source that comes back works again.
+    private func setupChanged() {
+        let s = Self.scan()
+        if s != sources { sources = s; onSourcesChanged?(s) }
+        inputs.removeAll { $0.input == nil }
+        for i in inputs { i.input?.setupChanged() }
+    }
+
+    static func scan() -> [MidiSource] {
+        (0..<MIDIGetNumberOfSources()).compactMap { i in
+            let e = MIDIGetSource(i)
+            guard e != 0 else { return nil }
+            var id: Int32 = 0
+            guard MIDIObjectGetIntegerProperty(e, kMIDIPropertyUniqueID, &id) == noErr else { return nil }
+            var name: Unmanaged<CFString>?
+            MIDIObjectGetStringProperty(e, kMIDIPropertyDisplayName, &name)
+            return MidiSource(uniqueID: id, name: name.map { $0.takeRetainedValue() as String } ?? "MIDI source \(id)")
+        }
+    }
+}
+
+/// One session's MIDI input: an input port on the shared client, connected
+/// to the chosen source (or every source, plus the shared virtual destination).
+///
+/// Nothing here calls into an Audio Unit. The receive blocks run on CoreMIDI's
+/// thread and only push packed events into the lock-free rings of `fanout`
+/// (`pc_midi.h`); the engine's render thread drains them into the instrument
+/// and music effects. Use from the main thread.
+final class MidiInput {
+    static var destinationName: String { MidiSystem.destinationName }
+    static let allSourcesName = "All MIDI Sources"
+
+    let system: MidiSystem
+    /// Never freed: CoreMIDI's receive blocks hold it. Reused by a later input once this one is gone.
+    let fanout: UnsafeMutablePointer<pc_midi_fanout>
+    private var port = MIDIPortRef()
+    /// "" (none), "*" (all), or a source's unique ID.
+    private var selection = ""
+    private var connected: Set<MIDIEndpointRef> = []
+
+    init(system: MidiSystem) {
+        self.system = system
+        fanout = system.takeFanout()
+        MIDIInputPortCreateWithProtocol(system.client, "Input" as CFString, ._1_0, &port, Self.receiver(fanout: fanout))
+        system.attach(self)
+    }
+
+    deinit {
+        MIDIPortDispose(port)
+        pc_store_u32(&fanout.pointee.virtual_enabled, 0)
+        active = 0
+        system.detach(fanout)
+    }
+
+    var sources: [MidiSource] { system.sources }
 
     /// Rings the receive blocks fill; 0 stops delivery (set before any engine teardown).
     var active: Int {
@@ -84,34 +154,20 @@ final class MidiInput {
         }
     }
 
-    /// Sources came or went: refresh the list and reconnect, so a source that comes back works again.
-    private func setupChanged() {
-        let s = Self.scan()
-        if s != sources { sources = s; onSourcesChanged?(s) }
+    /// The MIDI setup changed: drop sources that are gone and reconnect.
+    fileprivate func setupChanged() {
         connected = connected.filter { e in (0..<MIDIGetNumberOfSources()).contains { MIDIGetSource($0) == e } }
         connect(selection)
     }
 
-    static func scan() -> [MidiSource] {
-        (0..<MIDIGetNumberOfSources()).compactMap { i in
-            let e = MIDIGetSource(i)
-            guard e != 0 else { return nil }
-            var id: Int32 = 0
-            guard MIDIObjectGetIntegerProperty(e, kMIDIPropertyUniqueID, &id) == noErr else { return nil }
-            var name: Unmanaged<CFString>?
-            MIDIObjectGetStringProperty(e, kMIDIPropertyDisplayName, &name)
-            return MidiSource(uniqueID: id, name: name.map { $0.takeRetainedValue() as String } ?? "MIDI source \(id)")
-        }
-    }
-
     /// The receive block, on CoreMIDI's thread: no allocation and no Swift
-    /// objects, only the fanout pointer. Takes MIDI 1.0 channel-voice messages
+    /// objects, only the fanout pointer (an input port's) or the hub pointer
+    /// (the virtual destination's). Takes MIDI 1.0 channel-voice messages
     /// (UMP type 2) and ignores everything else.
-    private static func receiver(_ fanout: UnsafeMutablePointer<pc_midi_fanout>, virtual: Bool) -> MIDIReceiveBlock {
+    fileprivate static func receiver(fanout: UnsafeMutablePointer<pc_midi_fanout>? = nil, hub: UnsafeMutablePointer<pc_midi_hub>? = nil) -> MIDIReceiveBlock {
         // Packets are variable-length: read only `wordCount` words in place, never the declared 64.
         let wordsOffset = MemoryLayout<MIDIEventPacket>.offset(of: \MIDIEventPacket.words)!
         return { list, _ in
-            if virtual, pc_load_u32(&fanout.pointee.virtual_enabled) == 0 { return }
             for packet in list.unsafeSequence() {
                 let count = Int(packet.pointee.wordCount)
                 let words = (UnsafeRawPointer(packet) + wordsOffset).assumingMemoryBound(to: UInt32.self)
@@ -119,7 +175,9 @@ final class MidiInput {
                 while i < count {
                     let w = words[i]
                     // status << 16 | data1 << 8 | data2, the group nibble dropped.
-                    if w >> 28 == 2 { pc_midi_fanout_push(fanout, w & 0x00FF_7F7F) }
+                    if w >> 28 == 2 {
+                        if let fanout { pc_midi_fanout_push(fanout, w & 0x00FF_7F7F) } else if let hub { pc_midi_hub_push(hub, w & 0x00FF_7F7F) }
+                    }
                     i += umpWords(w >> 28)
                 }
             }

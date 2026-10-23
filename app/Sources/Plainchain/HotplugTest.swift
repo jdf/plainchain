@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import CoreAudio
+import CoreMIDI
 import Foundation
 
 /// The fake interface's id, for the signal handler (which cannot capture).
@@ -19,6 +20,7 @@ enum HotplugTest {
     static let fakeName = "Fake Interface"
 
     private static var subdevices: (input: Device, output: Device)!
+    private static var app: AppState!
     private static var model: Model!
     private static var watchers: Set<AnyCancellable> = []
 
@@ -92,12 +94,13 @@ enum HotplugTest {
         try createFake()
         print("created \(fakeName) id \(hotplugFakeId)")
 
-        model = Model(ephemeral: true)
-        // Invariants on every device list the model publishes.
-        model.$devices.sink { list in
+        app = AppState(ephemeral: true)
+        model = Model(app: app, ephemeral: true)
+        // Invariants on every device list the app publishes.
+        app.$devices.sink { list in
             let fakes = list.filter { $0.uid == fakeUid }.count
-            if fakes > 1 { fail("\(fakeName) listed \(fakes) times in model.devices") }
-            if let own = list.first(where: { $0.uid.hasPrefix(HAL.aggregatePrefix) }) { fail("model.devices lists a private aggregate: \(own.uid)") }
+            if fakes > 1 { fail("\(fakeName) listed \(fakes) times in app.devices") }
+            if let own = list.first(where: { $0.uid.hasPrefix(HAL.aggregatePrefix) }) { fail("app.devices lists a private aggregate: \(own.uid)") }
         }.store(in: &watchers)
 
         // 1. The fake as both input and output.
@@ -112,6 +115,121 @@ enum HotplugTest {
 
         // 3. Fake in, real out: Plainchain builds a private aggregate holding an aggregate.
         try scenario("fake in, real out (nested aggregate)", input: fakeUid, output: subdevices.output.uid, chain: [], cycles: 1, nested: true)
+
+        // 4. Two session windows at once on one AppState.
+        try twoSessions()
+    }
+
+    // MARK: Two sessions
+
+    /// Two models side by side, as two windows would run: A plays the fake
+    /// interface's input through AUDelay to its output; B plays MIDI from all
+    /// sources into Apple's DLS synth, straight to the device the fake wraps.
+    /// Both run with no render errors; a note reaches B's meters and not A's;
+    /// unplugging the fake tears down A only, B keeps running, and the replug
+    /// brings A back.
+    private static func twoSessions() throws {
+        print("\n== two sessions: A fake in 1-2 -> AUDelay -> fake out 3-4; B MIDI -> DLSMusicDevice -> \(subdevices.output.name) out 5-6")
+        let a = model!
+        let b = Model(app: app, ephemeral: true)
+        defer { b.enabled = false }
+        let delay = PluginId(type: "aufx", subtype: "dely", manufacturer: "appl")
+        let dls = PluginId(type: "aumu", subtype: "dls ", manufacturer: "appl")
+        func load(_ m: Model, _ s: Session) throws {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("multi-\(UUID().uuidString).plainchain")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try SessionFile.write(s, to: url)
+            try wait { await m.open(url, quietly: true) }
+            guard m.session.chain.count == s.chain.count else { throw EngineError("session loaded \(m.session.chain.count) of \(s.chain.count) plugins: \(m.error ?? "")") }
+        }
+        // Channels chosen so nothing loops back into A's input on a loopback device: A reads 1-2 and
+        // writes 3-4, B writes 5-6. On BlackHole A's input is then digital silence throughout.
+        try load(a, Session(input: Endpoint(deviceUid: fakeUid, channels: [0, 1]), output: Endpoint(deviceUid: fakeUid, channels: [2, 3]),
+                            chain: [ChainItem(plugin: delay)]))
+        try load(b, Session(input: Endpoint(deviceUid: "", channels: [], midiSource: "*", midiSourceName: MidiInput.allSourcesName),
+                            output: Endpoint(deviceUid: subdevices.output.uid, channels: [4, 5]), chain: [ChainItem(plugin: dls)]))
+        _ = try waitFor("both running", 5) {
+            a.status.running && a.error == nil && a.status.deviceName == fakeName
+                && b.status.running && b.error == nil && b.status.deviceName == subdevices.output.name
+        }
+        print("A running on '\(a.status.deviceName)', B on '\(b.status.deviceName)'")
+        guard app.liveModels.count == 2 else { throw EngineError("AppState knows \(app.liveModels.count) models, not 2") }
+
+        // B's running state and errors, watched through everything below.
+        var bFlips = 0
+        var bErrors: [String] = []
+        let w1 = b.$status.map(\.running).removeDuplicates().dropFirst().sink { _ in bFlips += 1 }
+        let w2 = b.$error.compactMap { $0 }.sink { bErrors.append($0) }
+        defer { w1.cancel(); w2.cancel() }
+
+        let errors0 = (a.status.renderErrors, b.status.renderErrors)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 2))
+        let errors1 = (a.status.renderErrors, b.status.renderErrors)
+        print("side by side for 2 s: render errors A \(errors1.0 - errors0.0), B \(errors1.1 - errors0.1)")
+        guard a.status.running, b.status.running, errors1.0 == errors0.0, errors1.1 == errors0.1 else {
+            throw EngineError("two sessions: A running \(a.status.running), B running \(b.status.running), render errors A \(errors1.0) B \(errors1.1)")
+        }
+
+        // A note from a virtual source: B's instrument meter moves, A's meters do not.
+        var client = MIDIClientRef()
+        try check(MIDIClientCreateWithBlock("Plainchain hotplug test" as CFString, &client, nil), "MIDI client")
+        defer { MIDIClientDispose(client) }
+        var source = MIDIEndpointRef()
+        try check(MIDISourceCreateWithProtocol(client, "Plainchain hotplug test" as CFString, ._1_0, &source), "virtual MIDI source")
+        func send(_ word: UInt32) {
+            var list = MIDIEventList()
+            var w = word
+            withUnsafeMutablePointer(to: &list) { p in
+                MIDIEventListAdd(p, MemoryLayout<MIDIEventList>.size, MIDIEventListInit(p, ._1_0), 0, 1, &w)
+                MIDIReceivedEventList(source, p)
+            }
+        }
+        let aHead = a.session.chain[0].id, bHead = b.session.chain[0].id
+        func aPeak() -> Float { a.levels.peaks[aHead]?.max() ?? 0 }
+        func bPeak() -> Float { b.levels.peaks[bHead]?.max() ?? 0 }
+        // The new source joins "all sources" through the MIDI setup change.
+        _ = try waitFor("B quiet before the note", 5) { bPeak() < 0.001 }
+        // A's level with no note: on a loopback device nothing writes A's input channels, so it is silence.
+        var aQuiet: Float = 0
+        let quiet = Date(timeIntervalSinceNow: 1)
+        while Date() < quiet { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02)); aQuiet = max(aQuiet, aPeak()) }
+        let aReceived = a.midi.received
+        var aMax: Float = 0
+        send(0x2090_3C64)
+        let t = try waitFor("B's instrument meter", 3) {
+            aMax = max(aMax, aPeak())
+            return bPeak() > 0.01 && b.levels.midiActive
+        }
+        let bAt = bPeak()
+        let deadline = Date(timeIntervalSinceNow: 0.5)
+        while Date() < deadline { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02)); aMax = max(aMax, aPeak()) }
+        send(0x2080_3C00)
+        print(String(format: "note into B: B instrument meter %.3f after %.0f ms; A meter max %.4f with no note, %.4f during it; A MIDI light %@, A MIDI events %u",
+                     bAt, t * 1000, aQuiet, aMax, a.levels.midiActive ? "on" : "off", a.midi.received &- aReceived))
+        guard !a.levels.midiActive, a.midi.received == aReceived else { throw EngineError("B's note reached A's MIDI input") }
+        guard aQuiet < 1e-6, aMax < 1e-6 else {
+            throw EngineError(String(format: "A's meter moved with B's note (%.4f with no note, %.4f during it)", aQuiet, aMax))
+        }
+
+        // Unplug the fake: A waits for it, B plays on.
+        destroyFake()
+        let down = try waitFor("A teardown", 3) { !a.status.running && (a.error ?? "").hasPrefix("Waiting for") }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        guard b.status.running, bFlips == 0, bErrors.isEmpty else {
+            throw EngineError("unplugging A's device disturbed B: running \(b.status.running), flips \(bFlips), errors \(bErrors)")
+        }
+        print(String(format: "unplug: A torn down after %.0f ms (\"%@\"); B still running", down * 1000, a.error ?? ""))
+        try createFake()
+        let up = try waitFor("A recovery", 5) { a.status.running && a.error == nil }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+        guard b.status.running, bFlips == 0, bErrors.isEmpty else {
+            throw EngineError("replugging A's device disturbed B: running \(b.status.running), flips \(bFlips), errors \(bErrors)")
+        }
+        print(String(format: "replug: A running again after %.0f ms; B never stopped, no errors", up * 1000))
+        let errors2 = (a.status.renderErrors, b.status.renderErrors)
+        print("render errors B over the whole scenario: \(errors2.1 - errors0.1)")
+        guard errors2.1 == errors0.1 else { throw EngineError("B had render errors across A's unplug and replug") }
+        try checkHAL()
     }
 
     // MARK: Scenario
@@ -121,8 +239,9 @@ enum HotplugTest {
         print("\n== \(title)")
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("hotplug-\(UUID().uuidString).plainchain")
         defer { try? FileManager.default.removeItem(at: url) }
+        // Out on 3-4, not 1-2: a loopback device (BlackHole in the guest) would feed the output back into the input.
         try SessionFile.write(Session(input: Endpoint(deviceUid: input, channels: [0, 1]),
-                                      output: Endpoint(deviceUid: output, channels: [0, 1]), chain: chain), to: url)
+                                      output: Endpoint(deviceUid: output, channels: [2, 3]), chain: chain), to: url)
         try wait { await model.open(url, quietly: true) }
         guard model.session.chain.count == chain.count else { throw EngineError("session loaded \(model.session.chain.count) of \(chain.count) plugins: \(model.error ?? "")") }
 

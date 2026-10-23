@@ -79,12 +79,20 @@ enum SessionFile {
         }
     }
 
-    /// Where the current state is kept between launches.
-    static var autosaveURL: URL {
+    /// `~/Library/Application Support/Plainchain`, created on first use.
+    static var supportDirectory: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Plainchain")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("Autosave.\(fileExtension)")
+        return dir
     }
+
+    /// Where a session window's state is kept between launches.
+    static func autosaveURL(for id: UUID) -> URL {
+        supportDirectory.appendingPathComponent("Autosave-\(id.uuidString).\(fileExtension)")
+    }
+
+    /// The single autosave of versions before session windows; migrated once.
+    static var legacyAutosaveURL: URL { supportDirectory.appendingPathComponent("Autosave.\(fileExtension)") }
 }
 
 // MARK: - Minimal SQLite wrapper

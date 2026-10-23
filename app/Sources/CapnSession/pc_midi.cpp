@@ -42,4 +42,24 @@ void pc_midi_fanout_push(pc_midi_fanout *f, uint32_t event) {
     busy.store(0, std::memory_order_release);
 }
 
+pc_midi_hub *pc_midi_hub_new(void) {
+    return static_cast<pc_midi_hub *>(std::calloc(1, sizeof(pc_midi_hub)));
+}
+
+bool pc_midi_hub_add(pc_midi_hub *h, pc_midi_fanout *f) {
+    uint32_t n = h->count;  // only the UI thread writes it
+    if (n >= PC_MIDI_MAX_FANOUTS) return false;
+    h->fanouts[n] = f;
+    pc_store_u32(&h->count, n + 1);
+    return true;
+}
+
+void pc_midi_hub_push(pc_midi_hub *h, uint32_t event) {
+    uint32_t n = pc_load_u32(&h->count);
+    for (uint32_t i = 0; i < n; i++) {
+        pc_midi_fanout *f = h->fanouts[i];
+        if (pc_load_u32(&f->virtual_enabled)) pc_midi_fanout_push(f, event);
+    }
+}
+
 }  // extern "C"

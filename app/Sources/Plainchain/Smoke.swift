@@ -72,9 +72,12 @@ enum Smoke {
             units.append(unit)
             chain.append(ChainItem(plugin: p.id, inputGainDb: -6))
         }
+        // In and out on one device with room to spare: out on 3-4, so a loopback device
+        // (BlackHole in the test VM) does not feed the output back into the input.
+        let outFirst: UInt32 = inp.uid == out.uid && out.outputChannels >= 4 ? 2 : 0
         let session = Session(
             input: Endpoint(deviceUid: inp.uid, channels: Array(0..<min(inp.inputChannels, 2))),
-            output: Endpoint(deviceUid: out.uid, channels: Array(0..<min(out.outputChannels, 2))),
+            output: Endpoint(deviceUid: out.uid, channels: Array(outFirst..<outFirst + min(out.outputChannels, 2))),
             chain: chain,
             bufferFrames: Int(env["PC_BUFFER"] ?? "") ?? 0
         )
@@ -122,7 +125,8 @@ enum Smoke {
             print("FAIL: watchdog: MIDI smoke still running after 60 s")
             _exit(1)
         }
-        let input = MidiInput()
+        let system = MidiSystem()
+        let input = MidiInput(system: system)
         var client = MIDIClientRef()
         try check(MIDIClientCreateWithBlock("Plainchain smoke" as CFString, &client, nil), "MIDI client")
         var source = MIDIEndpointRef()
@@ -132,7 +136,7 @@ enum Smoke {
         var port = MIDIPortRef()
         try check(MIDIOutputPortCreate(client, "Plainchain smoke out" as CFString, &port), "MIDI output port")
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
-        print("MIDI sources:", MidiInput.scan().map { "\($0.name) (\($0.uniqueID))" })
+        print("MIDI sources:", MidiSystem.scan().map { "\($0.name) (\($0.uniqueID))" })
 
         let ids = [("dls ", "aumu"), ("dely", "aufx"), ("lpas", "aufx")].map { PluginId(type: $0.1, subtype: $0.0, manufacturer: "appl") }
         let units = try ids.map { id in try wait { try await Plugins.instantiate(id) } }
@@ -152,7 +156,7 @@ enum Smoke {
             withUnsafeMutablePointer(to: &list) { p in
                 let packet = MIDIEventListInit(p, ._1_0)
                 MIDIEventListAdd(p, MemoryLayout<MIDIEventList>.size, packet, 0, 1, &w)
-                if toDestination { MIDISendEventList(port, input.destination, p) } else { MIDIReceivedEventList(source, p) }
+                if toDestination { MIDISendEventList(port, system.destination, p) } else { MIDIReceivedEventList(source, p) }
             }
         }
         func run(_ seconds: Double) { RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds)) }
@@ -231,14 +235,14 @@ enum Smoke {
         let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
         print("MIDI session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
         guard back == session, version == 2 else { throw EngineError("MIDI session did not round-trip") }
-        try MainActor.assumeIsolated { try midiModel(url, source: source, sourceID: sourceID, session: session) }
+        try MainActor.assumeIsolated { try midiModel(url, system: system, source: source, sourceID: sourceID, session: session) }
         print("PASS")
     }
 
     /// The app model in MIDI mode: the empty-head hint, loading a MIDI session,
     /// playing it, switching sources without a rebuild, and refused moves.
     @MainActor
-    private static func midiModel(_ url: URL, source: MIDIEndpointRef, sourceID: Int32, session: Session) throws {
+    private static func midiModel(_ url: URL, system: MidiSystem, source: MIDIEndpointRef, sourceID: Int32, session: Session) throws {
         func run(_ seconds: Double) { RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds)) }
         func until(_ what: String, _ seconds: Double, _ ok: () -> Bool) throws {
             let deadline = Date(timeIntervalSinceNow: seconds)
@@ -255,7 +259,7 @@ enum Smoke {
                 MIDIReceivedEventList(source, p)
             }
         }
-        let model = Model(ephemeral: true)
+        let model = Model(app: AppState(ephemeral: true, midi: system), ephemeral: true)
         model.update { $0.output = session.output; $0.input.midiSource = "\(sourceID)"; $0.input.midiSourceName = "Plainchain smoke" }
         try until("no instrument hint", 3) { model.status.running && model.error == nil && model.hint == "Add an instrument to play MIDI into" }
         print("model: MIDI input with no instrument runs silent with the hint")
