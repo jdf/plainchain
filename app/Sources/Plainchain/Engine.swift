@@ -33,7 +33,7 @@ import Foundation
 /// through lock-free rings (`pc_midi.h`) that the render thread drains.
 ///
 /// Plugin instances are owned by the caller; the engine only configures,
-/// wires, and (un)initializes them.
+/// wires, and (un)initializes them, and keeps their owners alive until it is torn down.
 final class Engine {
     struct Status: Equatable {
         var running = false
@@ -62,6 +62,8 @@ final class Engine {
         var gainDb: Float
         /// A music device at the chain head, played by MIDI; it is the graph's source.
         var isInstrument = false
+        /// Kept alive until the graph is torn down (the plugin instance that owns `unit`).
+        var owner: AnyObject? = nil
     }
 
     static let maxChannels = 32
@@ -88,6 +90,8 @@ final class Engine {
     /// input; after a reorder the slots are the same but their order differs.
     private var slots: [Int]
     private var tornDown = false
+    /// The stages' owners, released only after `deinit` has torn the graph down.
+    private let owners: [AnyObject]
     private var started = false
     private(set) var sampleRate = 0.0
     private(set) var width = 0
@@ -119,6 +123,7 @@ final class Engine {
         let rest = Array(chain.dropFirst(head == nil ? 0 : 1))
         instrument = head?.unit
         effects = rest.map(\.unit)
+        owners = chain.compactMap(\.owner)
         midiMode = input.isMidi
         self.midi = midi
         effectRings = Array(repeating: nil, count: rest.count)

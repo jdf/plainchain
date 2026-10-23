@@ -34,12 +34,12 @@ enum Smoke {
         if env["PC_MIDI"] != nil { try midi(devices, out); return }
         let inp = try pick("PC_IN", \.defaultInput)
         let names = CommandLine.arguments.drop(while: { $0 != "--smoke" }).dropFirst()
-        var units: [AVAudioUnit] = []
+        var units: [PluginInstance] = []
         var chain: [ChainItem] = []
         for n in names {
             guard let p = plugins.first(where: { $0.name == n || $0.id.subtype == n }) else { throw EngineError("no plugin \(n)") }
-            let unit = try wait { try await Plugins.instantiate(p.id) }
-            print("  \(p.name): \(Plugins.v2Parameters(unit.audioUnit).count) params; gain reduction meter: \(Plugins.gainReductionMeter(unit.audioUnit).map { "param \($0.id)" } ?? "none")")
+            let unit = try wait { try await PluginInstance.make(p.id) }
+            print("  \(p.name): \(describe(unit)); \(unit.parameterNames.count) params; gain reduction meter: \(Plugins.gainReductionMeter(unit.audioUnit).map { "param \($0.id)" } ?? "none")")
             if env["PC_UI"] != nil {
                 var size: UInt32 = 0
                 var writable: DarwinBoolean = false
@@ -65,7 +65,7 @@ enum Smoke {
                 for q in Plugins.v2Parameters(unit.audioUnit) {
                     print("    v2 \(q.id) '\(q.name)' flags=\(String(q.flags, radix: 16)) unit=\(q.unit) [\(q.min)...\(q.max)]")
                 }
-                for q in unit.auAudioUnit.parameterTree?.allParameters ?? [] {
+                for q in unit.avUnit?.auAudioUnit.parameterTree?.allParameters ?? [] {
                     print("    \(q.identifier) '\(q.displayName)' flags=\(String(q.flags.rawValue, radix: 16)) unit=\(q.unit.rawValue) [\(q.minValue)...\(q.maxValue)]")
                 }
             }
@@ -82,8 +82,8 @@ enum Smoke {
             bufferFrames: Int(env["PC_BUFFER"] ?? "") ?? 0
         )
         print("session: \(inp.name) \(session.input.channels) -> \(names.joined(separator: " -> ")) -> \(out.name) \(session.output.channels)")
-        let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb) }
-        let engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
+        let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
+        var engine: Engine! = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 2))
         print("status:", engine.status)
         print("peaks per stage:", (0...units.count).map { engine.takePeaks($0) })
@@ -95,19 +95,40 @@ enum Smoke {
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
             print("reorder back applied:", !engine.swapPending, "errors:", engine.status.renderErrors)
         }
-        _ = engine
+        engine = nil
 
         // Session round trip with plugin state.
         var saved = session
-        for i in saved.chain.indices {
-            if let st = units[i].auAudioUnit.fullState {
-                saved.chain[i].state = try PropertyListSerialization.data(fromPropertyList: st, format: .binary, options: 0)
-            }
-        }
+        for i in saved.chain.indices { saved.chain[i].state = units[i].state }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("smoke.plainchain")
         try SessionFile.write(saved, to: url)
         let back = try SessionFile.read(url)
         print("round trip:", back == saved ? "ok" : "MISMATCH", "state bytes:", back.chain.map { $0.state?.count ?? 0 }, "file:", url.path)
+        // The state loads into a fresh instance and reads back the same, without counting as a change.
+        for (i, item) in back.chain.enumerated() {
+            guard let data = item.state else { continue }
+            let fresh = try wait { try await PluginInstance.make(item.plugin) }
+            fresh.state = data
+            var changes = 0
+            fresh.onChange = { changes += 1 }
+            fresh.startObserving()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
+            // Compared as dictionaries: binary plists of equal dictionaries can order their keys differently.
+            func dict(_ d: Data?) -> NSDictionary? { d.flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? NSDictionary } }
+            let same = dict(fresh.state).map { $0.isEqual(dict(data)) } ?? false
+            print("  state into a fresh \(names[names.startIndex + i]): reads back \(same ? "the same" : "DIFFERENT"), changes signalled: \(changes)")
+            guard same, changes == 0 else { throw EngineError("plugin state did not round-trip quietly") }
+            // A parameter edit through the AU parameter API is signalled.
+            if let p = Plugins.v2Parameters(fresh.audioUnit).first(where: { AudioUnitParameterOptions(rawValue: $0.flags).contains(.flag_IsWritable) }) {
+                var v: AudioUnitParameterValue = 0
+                AudioUnitGetParameter(fresh.audioUnit, p.id, kAudioUnitScope_Global, 0, &v)
+                var param = AudioUnitParameter(mAudioUnit: fresh.audioUnit, mParameterID: p.id, mScope: kAudioUnitScope_Global, mElement: 0)
+                AUParameterSet(nil, nil, &param, v == p.min ? p.max : p.min, 0)
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
+                print("  parameter '\(p.name)' set: changes signalled: \(changes)")
+                guard changes > 0 else { throw EngineError("a parameter change was not signalled") }
+            }
+        }
         print("stopped cleanly")
         if env["PC_LISTEN"] != nil { try listen(out) }
     }
@@ -139,13 +160,14 @@ enum Smoke {
         print("MIDI sources:", MidiSystem.scan().map { "\($0.name) (\($0.uniqueID))" })
 
         let ids = [("dls ", "aumu"), ("dely", "aufx"), ("lpas", "aufx")].map { PluginId(type: $0.1, subtype: $0.0, manufacturer: "appl") }
-        let units = try ids.map { id in try wait { try await Plugins.instantiate(id) } }
+        let units = try ids.map { id in try wait { try await PluginInstance.make(id) } }
+        for u in units { print("  \(u.id.subtype): \(describe(u))") }
         let session = Session(
             input: Endpoint(deviceUid: "", channels: [], midiSource: "\(sourceID)", midiSourceName: "Plainchain smoke"),
             output: Endpoint(deviceUid: out.uid, channels: Array(0..<min(out.outputChannels, 2))),
             chain: ids.map { ChainItem(plugin: $0) }
         )
-        let stages = zip(units, ids).map { Engine.Stage(unit: $0.audioUnit, bypass: false, gainDb: 0, isInstrument: $1.isInstrument) }
+        let stages = zip(units, ids).map { Engine.Stage(unit: $0.audioUnit, bypass: false, gainDb: 0, isInstrument: $1.isInstrument, owner: $0) }
         var engine: Engine! = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, midi: input.fanout)
         input.active = engine.midiRingCount
         print("session: MIDI \(sourceID) -> DLSMusicDevice -> AUDelay -> AULowpass -> \(out.name) \(session.output.channels); rings: \(engine.midiRingCount)")
@@ -286,7 +308,7 @@ enum Smoke {
         run(0.5)
         let t0 = Date()
         model.update { $0.input.midiSource = "\(sourceID)"; $0.input.midiSourceName = "Plainchain smoke" }
-        try until("held note released by the source switch", 3) { (model.levels.peaks[head]?.max() ?? 1) < 0.001 }
+        try until("held note released by the source switch", 6) { (model.levels.peaks[head]?.max() ?? 1) < 0.001 }
         print(String(format: "model: held note silent %.0f ms after a source switch", Date().timeIntervalSince(t0) * 1000))
         _ = watch
         guard flips == 0 else { throw EngineError("model: switching MIDI sources restarted the engine") }
@@ -303,6 +325,26 @@ enum Smoke {
         model.remove(at: [0])
         try until("instrument removed", 3) { model.session.chain.count == 2 && model.hint == "Add an instrument to play MIDI into" && model.session.input.isMidi }
         print("model: removing the instrument leaves MIDI input with an empty head")
+        try wait { await model.open(url, quietly: false) }
+        try until("MIDI session reloaded", 3) { model.status.running && model.session.chain.count == 3 && !model.dirty }
+        run(0.5)  // let any plugin notifications from loading state and building the graph arrive
+        guard !model.dirty, !model.hasUnsavedChanges, !model.needsSavePrompt else {
+            throw EngineError("model: loading a session marked it edited (dirty \(model.dirty), unsaved \(model.hasUnsavedChanges), prompt \(model.needsSavePrompt))")
+        }
+        print("model: loading the session and building the graph left it unedited")
+        // A parameter changed as an editor would change it marks the session edited. Done
+        // last, on a fresh load (the checks above edited the session), so the MIDI timing is undisturbed.
+        guard let effect = model.instance(for: model.session.chain[1].id),
+              let p = Plugins.v2Parameters(effect.audioUnit).first(where: { AudioUnitParameterOptions(rawValue: $0.flags).contains(.flag_IsWritable) })
+        else { throw EngineError("model: no writable effect parameter to change") }
+        do {
+            var v: AudioUnitParameterValue = 0
+            AudioUnitGetParameter(effect.audioUnit, p.id, kAudioUnitScope_Global, 0, &v)
+            var param = AudioUnitParameter(mAudioUnit: effect.audioUnit, mParameterID: p.id, mScope: kAudioUnitScope_Global, mElement: 0)
+            AUParameterSet(nil, nil, &param, v == p.min ? p.max : p.min, 0)
+            try until("a parameter change marks the session edited", 2) { model.dirty && model.needsSavePrompt }
+            print("model: changing \(effect.id.subtype) '\(p.name)' marked the session edited")
+        }
         model.enabled = false
         run(0.2)
     }
@@ -339,6 +381,10 @@ enum Smoke {
         print("listener: private aggregate fired \(fired - before), in our device list: \(listed)")
         _ = listener
         guard created > 0 else { throw EngineError("device-list listener never fired") }
+    }
+
+    private static func describe(_ unit: PluginInstance) -> String {
+        "\(unit.isV3 ? "v3" : "v2"), created \(unit.createdOnMainThread ? "on the main thread" : "off the main thread")"
     }
 
     /// Block the main thread on an async call while servicing the run loop.

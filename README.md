@@ -17,7 +17,8 @@ Sessions (devices, chain, and every plugin's state) save to `.plainchain` files:
 | `app/Package.swift` | SwiftPM package; the whole app is one executable target. |
 | `app/Sources/Plainchain/Engine.swift` | The realtime graph. |
 | `app/Sources/Plainchain/Devices.swift` | CoreAudio HAL enumeration and aggregate-device creation. |
-| `app/Sources/Plainchain/Plugins.swift` | Audio Unit discovery and instantiation. |
+| `app/Sources/Plainchain/Plugins.swift` | Audio Unit discovery and parameter info. |
+| `app/Sources/Plainchain/PluginInstance.swift` | One loaded Audio Unit: instantiation, state, and the parameter-change signal. |
 | `app/Sources/Plainchain/Midi.swift` | CoreMIDI input: `MidiSystem` (the one client, source list, and "Plainchain" virtual destination) and `MidiInput` (each session's input port). |
 | `app/Sources/Plainchain/AppState.swift` | What the windows share: device list and HAL listeners, plugin list, MIDI sources, the open-session list restored at launch, file opens. |
 | `app/Sources/Plainchain/Model.swift` | One session window: session edits, plugin instances, engine restarts, autosave, session files, the close prompt. |
@@ -75,7 +76,9 @@ The guest is whatis's `whatis-tests` Tart VM, and it must be booted with `--no-a
 
 Effects are wired with `kAudioUnitProperty_MakeConnection`. The first effect's render callback pulls the current IO cycle's input straight from the HAL unit into the effect's own buffers, so there is no intermediate buffer and no added latency beyond the device's own.
 
-Plugin instances are `AVAudioUnit`s owned by the model, not the engine. The engine only sets their formats, wires them, and initializes them, so rebuilding the graph (device or channel change, reorder) keeps every plugin's settings. Editor windows come from `AUAudioUnit.requestViewController`, with `AUGenericView` as the fallback. Plugin state is `AUAudioUnit.fullState`, stored as a binary plist inside the chain item's record.
+Plugin instances (`PluginInstance`) are owned by the model, not the engine. The engine only sets their formats, wires them, and initializes them (and holds a reference until it is torn down, so a unit is never disposed under a running graph), so rebuilding the graph (device or channel change, reorder) keeps every plugin's settings. Version 2 components are instantiated synchronously on the main thread with `AudioComponentInstanceNew`, as mainstream hosts do: JUCE-based and similar plugins take the thread that creates them as their message thread, and an editor shown on the main thread after a background instantiation spins or refuses to draw (Arturia, Pianoteq). Version 3 components run out of process and keep `AVAudioUnit.instantiate`. Editor windows try the plugin's v2 Cocoa view, then a v3 plugin's `requestViewController`, then `AUGenericView`. Plugin state is `kAudioUnitProperty_ClassInfo` for v2 and `AUAudioUnit.fullState` for v3 (for a v2 unit the two are the same dictionary), stored as a binary plist inside the chain item's record.
+
+Plugin edits are observed rather than polled: an `AUEventListener` on each v2 unit's parameters (and its `PresentPreset` and `ClassInfo` properties), or a parameter-tree observer for v3, marks the session edited when a value actually changes. Observation starts after the host has loaded the plugin's state, and notifications that repeat a known value are ignored, so opening a session or rebuilding the graph does not count as an edit. Full plugin state is read only when a file is written.
 
 ### MIDI input
 

@@ -3,14 +3,18 @@ import AudioToolbox
 import AVFoundation
 import CoreAudioKit
 
-/// A plugin's editor window. Tries, in order: the plugin's own v2 Cocoa view,
-/// the view controller the v3 bridge offers, then a generic parameter view.
+/// A plugin's editor window, created on the main thread. Tries, in order: the
+/// plugin's own v2 Cocoa view, a v3 plugin's view controller, then a generic parameter view.
 final class EditorWindow: NSWindow {
     var onClose: (() -> Void)?
+    /// The plugin stays loaded while its view is up.
+    private var plugin: PluginInstance?
 
-    static func open(for unit: AVAudioUnit, title: String, completion: @escaping (EditorWindow) -> Void) {
+    static func open(for unit: PluginInstance, title: String, completion: @escaping (EditorWindow) -> Void) {
+        precondition(Thread.isMainThread)
         func present(_ vc: NSViewController) {
             let window = EditorWindow(contentViewController: vc)
+            window.plugin = unit
             window.title = title
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
@@ -23,18 +27,18 @@ final class EditorWindow: NSWindow {
             present(vc)
             return
         }
-        unit.auAudioUnit.requestViewController { controller in
+        func presentGeneric() {
+            let generic = NSViewController()
+            let view = AUGenericView(audioUnit: unit.audioUnit)
+            view.showsExpertParameters = true
+            view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
+            generic.view = view
+            present(generic)
+        }
+        guard let av = unit.avUnit else { presentGeneric(); return }
+        av.auAudioUnit.requestViewController { controller in
             DispatchQueue.main.async {
-                if let controller {
-                    present(controller)
-                } else {
-                    let generic = NSViewController()
-                    let view = AUGenericView(audioUnit: unit.audioUnit)
-                    view.showsExpertParameters = true
-                    view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
-                    generic.view = view
-                    present(generic)
-                }
+                if let controller { present(controller) } else { presentGeneric() }
             }
         }
     }
@@ -70,5 +74,7 @@ final class EditorWindow: NSWindow {
         onClose?()
         onClose = nil
         super.close()
+        contentViewController = nil
+        plugin = nil
     }
 }

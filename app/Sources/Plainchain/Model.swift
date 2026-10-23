@@ -36,6 +36,8 @@ final class Model: ObservableObject {
     @Published private(set) var hint: String?
     @Published private(set) var sessionURL: URL?
     @Published private(set) var dirty = false
+    /// Whether the autosave file is behind the session; cleared by each write.
+    private var autosaveStale = true
     @Published private(set) var busy = false
     let levels = Levels()
     /// MIDI input; its rings feed the engine in MIDI mode, and it costs nothing otherwise.
@@ -50,15 +52,14 @@ final class Model: ObservableObject {
     /// The session as created, before any restore or edit: `isPristine` compares against it,
     /// not the current system defaults, so plugging in headphones does not make a window "touched".
     private let initialSession: Session
-    /// The session and plugin states as last loaded from or saved to `sessionURL`;
-    /// nil when there is no such baseline (untitled, or restored with unsaved edits).
-    private var savedBaseline: (session: Session, states: [UUID: NSDictionary])?
     /// A load problem to keep showing once the engine is up (the rebuild otherwise clears `error`).
     private var loadNotice: String?
     private var midiReceived: UInt32 = 0
     private var midiQuietTicks = 0
 
-    private var instances: [UUID: AVAudioUnit] = [:]
+    private var instances: [UUID: PluginInstance] = [:]
+    /// A plugin change is waiting to be marked; further ones until then coalesce into it.
+    private var pluginChangePending = false
     /// Read-only meter parameters that report gain reduction, where a plugin has one.
     private var reductionMeters: [UUID: Plugins.ReductionMeter] = [:]
     private var editors: [UUID: EditorWindow] = [:]
@@ -110,7 +111,8 @@ final class Model: ObservableObject {
             if let saved = try? SessionFile.read(SessionFile.autosaveURL(for: ref.id)) {
                 await load(saved, from: file)
                 guard !Task.isCancelled, !closed else { return }
-                if file != nil { dirty = true; savedBaseline = nil }  // a titled session's autosave holds edits not yet saved
+                if file != nil { dirty = true }  // a titled session's autosave holds edits not yet saved
+                autosaveStale = false  // the autosave file is what was just loaded
             } else if let file {
                 await open(file, quietly: false)
                 guard !Task.isCancelled, !closed else { return }
@@ -165,6 +167,8 @@ final class Model: ObservableObject {
     var chainWidth: Int { isMidi ? (session.output.channels.count >= 2 ? 2 : 1) : session.input.channels.count }
     func name(of id: PluginId) -> String { plugin(id)?.name ?? "\(id.manufacturer) \(id.subtype)" }
     func isEditorOpen(_ id: UUID) -> Bool { editors[id] != nil }
+    /// The loaded plugin for a chain item (for the headless checks).
+    func instance(for id: UUID) -> PluginInstance? { instances[id] }
 
     // MARK: Editing
 
@@ -210,9 +214,23 @@ final class Model: ObservableObject {
         }
     }
 
-    private func register(_ unit: AVAudioUnit, for id: UUID) {
+    /// Keep a loaded plugin and watch it for changes made in its editor (or by
+    /// MIDI), which mark the session edited. Call after any state is loaded into it.
+    private func register(_ unit: PluginInstance, for id: UUID) {
         instances[id] = unit
         reductionMeters[id] = Plugins.gainReductionMeter(unit.audioUnit)
+        unit.onChange = { [weak self] in self?.pluginChanged() }
+        unit.startObserving()
+    }
+
+    private func pluginChanged() {
+        guard !pluginChangePending, !loading, !closed else { return }
+        pluginChangePending = true
+        Task {
+            pluginChangePending = false
+            guard !loading, !closed else { return }
+            markDirty()
+        }
     }
 
     func add(_ plugin: Plugin) {
@@ -222,7 +240,7 @@ final class Model: ObservableObject {
             do {
                 if plugin.isInstrument, hasInstrument { throw EngineError("the chain already has an instrument") }
                 let item = ChainItem(plugin: plugin.id)
-                let unit = try await Plugins.instantiate(plugin.id)
+                let unit = try await PluginInstance.make(plugin.id)
                 guard !closed else { return }
                 register(unit, for: item.id)
                 update { s in
@@ -243,11 +261,14 @@ final class Model: ObservableObject {
 
     func remove(at offsets: IndexSet) {
         let ids = offsets.map { session.chain[$0].id }
+        let removed = ids.map { instances[$0] }
         update { $0.chain.remove(atOffsets: offsets) }
         // The engine has been scheduled to rebuild without these units; drop them after it does.
+        // (An engine also retains its units, so one still running cannot outlive them.)
         Task {
             try? await Task.sleep(for: .milliseconds(400))
-            for id in ids {
+            // A session loaded meanwhile may reuse these ids (the same file again); leave its plugins alone.
+            for (id, unit) in zip(ids, removed) where instances[id] === unit {
                 editors[id]?.close()
                 instances[id] = nil
                 reductionMeters[id] = nil
@@ -353,14 +374,14 @@ final class Model: ObservableObject {
     private func snapshot() -> Session {
         var s = session
         for i in s.chain.indices {
-            guard let state = instances[s.chain[i].id]?.auAudioUnit.fullState else { continue }
-            s.chain[i].state = try? PropertyListSerialization.data(fromPropertyList: state, format: .binary, options: 0)
+            s.chain[i].state = instances[s.chain[i].id]?.state
         }
         return s
     }
 
     private func markDirty() {
         dirty = true
+        autosaveStale = true
         loadNotice = nil
         // An untitled window whose file failed to load becomes its own session once edited.
         if sessionURL == nil { requestedPath = nil }
@@ -377,29 +398,17 @@ final class Model: ObservableObject {
     func autosave() {
         guard !ephemeral, !closed else { return }
         if sessionURL != nil && !hasUnsavedChanges { discardAutosave(); return }
+        // Nothing changed since the last write: skip it, so quitting does not
+        // read every plugin's state (an instrument's can take seconds).
+        guard autosaveStale else { return }
         try? SessionFile.write(snapshot(), to: SessionFile.autosaveURL(for: id))
+        autosaveStale = false
     }
 
-    /// Every plugin's current state, for comparing with the saved baseline.
-    private func pluginStates() -> [UUID: NSDictionary] {
-        var states: [UUID: NSDictionary] = [:]
-        for item in session.chain {
-            if let state = instances[item.id]?.auAudioUnit.fullState { states[item.id] = state as NSDictionary }
-        }
-        return states
-    }
-
-    private func recordBaseline() {
-        savedBaseline = (session, pluginStates())
-    }
-
-    /// The titled session differs from its file: session edits (`dirty`), or
-    /// plugin settings changed in an editor, which never mark the session dirty.
-    var hasUnsavedChanges: Bool {
-        guard sessionURL != nil else { return false }
-        guard !dirty, let base = savedBaseline, base.session == session else { return true }
-        return base.states != pluginStates()
-    }
+    /// The titled session differs from its file: session edits and plugin
+    /// changes (parameters, presets) mark it dirty, and so does restoring it
+    /// from an autosave that held unsaved edits.
+    var hasUnsavedChanges: Bool { sessionURL != nil && dirty }
 
     private func discardAutosave() {
         guard !ephemeral else { return }
@@ -453,7 +462,6 @@ final class Model: ObservableObject {
             sessionURL = url
             requestedPath = nil
             dirty = false
-            recordBaseline()
             autosaveTask?.cancel()
             discardAutosave()
             app.writeOpenSessions()
@@ -484,13 +492,10 @@ final class Model: ObservableObject {
         var kept: [ChainItem] = []
         for var item in s.chain {
             do {
-                let unit = try await Plugins.instantiate(item.plugin)
-                if let data = item.state,
-                   let state = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
-                    unit.auAudioUnit.fullState = state
-                }
+                let unit = try await PluginInstance.make(item.plugin)
+                if let data = item.state { unit.state = data }
                 item.state = nil
-                register(unit, for: item.id)
+                register(unit, for: item.id)  // observes from here on, so loading the state does not count as an edit
                 kept.append(item)
             } catch {
                 failures.append(name(of: item.plugin))
@@ -502,7 +507,6 @@ final class Model: ObservableObject {
         sessionURL = url
         requestedPath = nil
         dirty = false
-        if url != nil { recordBaseline() } else { savedBaseline = nil }
         loadNotice = failures.isEmpty ? nil : "could not load: " + failures.joined(separator: ", ")
         error = loadNotice
         app.writeOpenSessions()
@@ -561,9 +565,19 @@ final class Model: ObservableObject {
     }
 
     /// The app is quitting: autosave and stop, keeping the autosave for the next launch.
+    /// Quit: write the autosave, then dispose every plugin before the process
+    /// exits. A plugin left alive at exit runs its static destructors under
+    /// live threads and aborts (Arturia's did).
     func shutdown() {
         autosave()
+        pollTask?.cancel()
+        restartTask?.cancel()
         engine = nil
+        midi.connect("")
+        for w in editors.values { w.close() }
+        editors = [:]
+        reductionMeters = [:]
+        instances = [:]
     }
 
     /// The window was closed on purpose: stop everything, close the editors,

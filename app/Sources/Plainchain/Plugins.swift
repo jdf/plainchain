@@ -88,14 +88,4 @@ enum Plugins {
             return V2Parameter(id: id, name: name, flags: info.flags.rawValue, unit: info.unit.rawValue, min: info.minValue, max: info.maxValue)
         }
     }
-
-    /// Instantiate a plugin. In-process when the plugin allows it, so the
-    /// engine can wire its raw Audio Unit directly.
-    static func instantiate(_ id: PluginId) async throws -> AVAudioUnit {
-        try await withCheckedThrowingContinuation { cont in
-            AVAudioUnit.instantiate(with: id.description, options: []) { unit, error in
-                if let unit { cont.resume(returning: unit) } else { cont.resume(throwing: error ?? EngineError("could not load plugin")) }
-            }
-        }
-    }
 }
