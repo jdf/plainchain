@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "pc_atomic.h"
+#include "pc_midi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,13 +21,16 @@ typedef struct pc_bytes { const uint8_t *bytes; size_t len; } pc_bytes;
 void pc_buf_free(pc_buf buf);
 
 /* ---- Endpoint ---- */
-pc_buf pc_endpoint_encode(const char *device_uid, const uint32_t *channels, size_t channel_count);
+pc_buf pc_endpoint_encode(const char *device_uid, const uint32_t *channels, size_t channel_count,
+                          const char *midi_source, const char *midi_source_name);
 
 typedef struct pc_endpoint pc_endpoint;
 pc_endpoint *pc_endpoint_read(const uint8_t *bytes, size_t len);   /* NULL if malformed */
 const char *pc_endpoint_device_uid(const pc_endpoint *e);
 size_t pc_endpoint_channel_count(const pc_endpoint *e);
 uint32_t pc_endpoint_channel(const pc_endpoint *e, size_t index);
+const char *pc_endpoint_midi_source(const pc_endpoint *e);        /* "" in older files */
+const char *pc_endpoint_midi_source_name(const pc_endpoint *e);
 void pc_endpoint_free(pc_endpoint *e);
 
 /* ---- ChainItem ---- */

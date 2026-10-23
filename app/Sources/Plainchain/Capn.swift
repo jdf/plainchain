@@ -4,7 +4,7 @@ import Foundation
 /// Swift face of the Cap'n Proto records in schema/session.capnp.
 enum Capn {
     static func encode(_ e: Endpoint) -> Data {
-        let buf = e.channels.withUnsafeBufferPointer { pc_endpoint_encode(e.deviceUid, $0.baseAddress, $0.count) }
+        let buf = e.channels.withUnsafeBufferPointer { pc_endpoint_encode(e.deviceUid, $0.baseAddress, $0.count, e.midiSource, e.midiSourceName) }
         defer { pc_buf_free(buf) }
         return Data(bytes: buf.bytes, count: buf.len)
     }
@@ -16,7 +16,9 @@ enum Capn {
         defer { pc_endpoint_free(r) }
         return Endpoint(
             deviceUid: String(cString: pc_endpoint_device_uid(r)),
-            channels: (0..<pc_endpoint_channel_count(r)).map { pc_endpoint_channel(r, $0) }
+            channels: (0..<pc_endpoint_channel_count(r)).map { pc_endpoint_channel(r, $0) },
+            midiSource: String(cString: pc_endpoint_midi_source(r)),
+            midiSourceName: String(cString: pc_endpoint_midi_source_name(r))
         )
     }
 

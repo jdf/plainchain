@@ -11,7 +11,7 @@ ICONSRC := app/Assets/icon-1024.png
 SIGN    := $(if $(DEVELOPER_ID_APPLICATION),"$(DEVELOPER_ID_APPLICATION)",-)
 PROFILE ?= plainchain
 
-.PHONY: all app bundle run install smoke hotplug-test clean icon notarize dist
+.PHONY: all app bundle run install smoke hotplug-test midi-test clean icon notarize dist
 
 all: bundle
 
@@ -73,6 +73,12 @@ smoke: bundle
 # under a running session. tools/testvm.sh up/down manage the guest.
 hotplug-test: bundle
 	tools/testvm.sh hotplug
+
+# MIDI input, in the Tart test VM: a virtual MIDI source plays Apple's DLS synth
+# into the default output, by source, through "all sources", and through the
+# app's virtual destination (Plainchain --smoke with PC_MIDI=1).
+midi-test: bundle
+	tools/testvm.sh midi
 
 clean:
 	rm -rf app/.build "$(BUILD)"

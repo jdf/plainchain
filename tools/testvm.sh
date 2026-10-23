@@ -11,6 +11,7 @@
 #   tools/testvm.sh run [--aqua] <cmd...> (ssh into the guest; --aqua runs in the console user's GUI session)
 #   tools/testvm.sh push                 (build/Plainchain.app -> guest ~/Plainchain.app)
 #   tools/testvm.sh hotplug              (push, then Plainchain --hotplug-test in the Aqua session; exit status passed through)
+#   tools/testvm.sh midi                 (push, then PC_MIDI=1 Plainchain --smoke in the Aqua session; exit status passed through)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -100,8 +101,13 @@ hotplug)
     # microphone to sshd, not to Plainchain, and coreaudiod waits on a prompt.
     run --aqua Plainchain.app/Contents/MacOS/Plainchain --hotplug-test
     ;;
+midi)
+    shift
+    push
+    run --aqua /usr/bin/env PC_MIDI=1 Plainchain.app/Contents/MacOS/Plainchain --smoke
+    ;;
 *)
-    echo "usage: tools/testvm.sh [status|up|down|push|hotplug|run [--aqua] <command> [args...]]" >&2
+    echo "usage: tools/testvm.sh [status|up|down|push|hotplug|midi|run [--aqua] <command> [args...]]" >&2
     exit 2
     ;;
 esac

@@ -5,6 +5,9 @@
 struct Endpoint {
   deviceUid @0 :Text;
   channels  @1 :List(UInt32);   # zero-based device channels in use
+  midiSource @2 :Text;          # input only: non-empty means MIDI input; a CoreMIDI source's
+                                # kMIDIPropertyUniqueID in decimal, or "*" for all sources
+  midiSourceName @3 :Text;      # that source's display name when it was chosen
 }
 
 struct ChainItem {

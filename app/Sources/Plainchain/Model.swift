@@ -12,6 +12,8 @@ final class Levels: ObservableObject {
     @Published var peaks: [UUID: [Float]] = [:]
     /// Gain reduction in dB (≤ 0), for plugins that expose a meter for it.
     @Published var reduction: [UUID: Float] = [:]
+    /// MIDI arrived within the last ~150 ms.
+    @Published var midiActive = false
 }
 
 /// All app state. Session edits are autosaved and, when the engine is
@@ -26,16 +28,27 @@ final class Model: ObservableObject {
     @Published var enabled: Bool { didSet { enabled ? scheduleRestart() : stop() } }
     @Published private(set) var status = Engine.Status()
     @Published private(set) var error: String?
+    /// A normal state worth pointing out, such as MIDI input with no instrument; not an error.
+    @Published private(set) var hint: String?
     @Published private(set) var sessionURL: URL?
     @Published private(set) var dirty = false
     @Published private(set) var busy = false
+    @Published private(set) var midiSources: [MidiSource] = []
     let levels = Levels()
+    /// MIDI input; its rings feed the engine in MIDI mode, and it costs nothing otherwise.
+    let midi = MidiInput()
+    private var midiReceived: UInt32 = 0
+    private var midiQuietTicks = 0
 
     private var instances: [UUID: AVAudioUnit] = [:]
     /// Read-only meter parameters that report gain reduction, where a plugin has one.
     private var reductionMeters: [UUID: Plugins.ReductionMeter] = [:]
     private var editors: [UUID: EditorWindow] = [:]
-    private var engine: Engine? { didSet { if engine !== oldValue { aliveListeners = [] } } }
+    private var engine: Engine? {
+        // MIDI delivery stops before the graph that drains it goes away.
+        willSet { if newValue !== engine { midi.active = 0 } }
+        didSet { if engine !== oldValue { aliveListeners = [] } }
+    }
     private var restartTask: Task<Void, Never>?
     private var autosaveTask: Task<Void, Never>?
     /// The engine is down only because a session device is missing, and comes back when it returns.
@@ -64,6 +77,7 @@ final class Model: ObservableObject {
         self.devices = devices
         for d in devices { deviceNames[d.uid] = d.name }
         plugins = Plugins.installed()
+        midiSources = midi.sources
         session = Self.defaultSession(devices)
         enabled = true  // the engine runs from launch; the Run switch is for pausing
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
@@ -76,6 +90,7 @@ final class Model: ObservableObject {
         deviceListeners = [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice].compactMap {
             try? HAL.listen(sys, $0) { [weak self] in Task { @MainActor in self?.refreshDevices() } }
         }
+        midi.onSourcesChanged = { [weak self] s in MainActor.assumeIsolated { self?.midiSources = s } }
         Task {
             if !ephemeral, let path = UserDefaults.standard.string(forKey: Self.sessionPathKey), FileManager.default.fileExists(atPath: path) {
                 await open(URL(fileURLWithPath: path), quietly: true)
@@ -101,6 +116,12 @@ final class Model: ObservableObject {
     var outputDevices: [Device] { devices.filter { $0.outputChannels > 0 } }
     func device(uid: String) -> Device? { devices.first { $0.uid == uid } }
     func plugin(_ id: PluginId) -> Plugin? { plugins.first { $0.id == id } }
+    var isMidi: Bool { session.input.isMidi }
+    var hasInstrument: Bool { session.chain.first?.plugin.isInstrument == true }
+    /// MIDI input with nothing to play it: the head slot waits for an instrument.
+    var needsInstrument: Bool { isMidi && !hasInstrument }
+    /// Channels flowing through the chain.
+    var chainWidth: Int { isMidi ? (session.output.channels.count >= 2 ? 2 : 1) : session.input.channels.count }
     func name(of id: PluginId) -> String { plugin(id)?.name ?? "\(id.manufacturer) \(id.subtype)" }
     func isEditorOpen(_ id: UUID) -> Bool { editors[id] != nil }
 
@@ -110,6 +131,19 @@ final class Model: ObservableObject {
         var next = session
         mutate(&next)
         guard next != session else { return }
+        // Another MIDI source in MIDI mode: reconnect, no rebuild.
+        var sameButSource = next
+        sameButSource.input.midiSource = session.input.midiSource
+        sameButSource.input.midiSourceName = session.input.midiSourceName
+        if sameButSource == session, next.input.isMidi, session.input.isMidi {
+            session = next
+            markDirty()
+            if enabled {
+                midi.releaseAll()
+                midi.connect(next.input.midiSource)
+            }
+            return
+        }
         let sameSetup = next.input == session.input && next.output == session.output && next.bufferFrames == session.bufferFrames
         let liveOnly = sameSetup && next.chain.map(\.id) == session.chain.map(\.id)
         // A pure reorder: same items, same settings, different order.
@@ -145,9 +179,15 @@ final class Model: ObservableObject {
             busy = true
             defer { busy = false }
             do {
+                if plugin.isInstrument, hasInstrument { throw EngineError("the chain already has an instrument") }
                 let item = ChainItem(plugin: plugin.id)
                 register(try await Plugins.instantiate(plugin.id), for: item.id)
-                update { $0.chain.append(item) }
+                update { s in
+                    guard plugin.isInstrument else { s.chain.append(item); return }
+                    // An instrument heads the chain and needs MIDI input.
+                    s.chain.insert(item, at: 0)
+                    if !s.input.isMidi { s.input.midiSource = "*"; s.input.midiSourceName = MidiInput.allSourcesName }
+                }
                 // Some plugins only offer their view once initialized, so wait for the rebuild.
                 await restartTask?.value
                 openEditor(item)
@@ -173,7 +213,13 @@ final class Model: ObservableObject {
         }
     }
 
-    func move(from: IndexSet, to: Int) { update { $0.chain.move(fromOffsets: from, toOffset: to) } }
+    /// Refuses any order that moves an instrument off position 0 or puts an effect before it.
+    func move(from: IndexSet, to: Int) {
+        var chain = session.chain
+        chain.move(fromOffsets: from, toOffset: to)
+        guard !chain.dropFirst().contains(where: \.plugin.isInstrument), chain.first?.plugin.isInstrument == hasInstrument else { return }
+        update { $0.chain = chain }
+    }
 
     /// Open the plugin's editor, or bring it forward if it is already open.
     func openEditor(_ item: ChainItem) {
@@ -217,9 +263,9 @@ final class Model: ObservableObject {
     private var inputName: String { deviceNames[session.input.deviceUid] ?? "input device" }
     private var outputName: String { deviceNames[session.output.deviceUid] ?? "output device" }
 
-    /// The name of a session device that is not connected, if any.
+    /// The name of a session device that is not connected, if any. A MIDI input has no device.
     private var missingDevice: String? {
-        if device(uid: session.input.deviceUid) == nil { return inputName }
+        if !isMidi, device(uid: session.input.deviceUid) == nil { return inputName }
         if device(uid: session.output.deviceUid) == nil { return outputName }
         return nil
     }
@@ -239,7 +285,7 @@ final class Model: ObservableObject {
     private func reconcileDevices() {
         guard !loading else { return }  // `load` restarts on its own when it is done
         if let engine {
-            if device(uid: session.input.deviceUid)?.id != engine.inputDevice {
+            if !isMidi, device(uid: session.input.deviceUid)?.id != engine.inputDevice {
                 awaitDevice(inputName)
             } else if device(uid: session.output.deviceUid)?.id != engine.outputDevice {
                 awaitDevice(outputName)
@@ -261,7 +307,7 @@ final class Model: ObservableObject {
         guard let engine, id == engine.inputDevice || id == engine.outputDevice else { return }
         let alive: UInt32 = (try? HAL.get(id, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, UInt32(0))) ?? 0
         guard alive == 0 else { return }
-        awaitDevice(id == engine.inputDevice ? inputName : outputName)
+        awaitDevice(id == engine.outputDevice ? outputName : inputName)
         refreshDevices()
         reconcileDevices()
     }
@@ -398,6 +444,7 @@ final class Model: ObservableObject {
 
     private func restart() {
         engine = nil
+        hint = nil
         if let missing = missingDevice { awaitDevice(missing); return }
         // A failed recovery build (device still settling) stays armed for the next device change.
         let recovering = awaitingDevice
@@ -405,9 +452,16 @@ final class Model: ObservableObject {
         let units = session.chain.compactMap { instances[$0.id]?.audioUnit }
         guard units.count == session.chain.count else { return }
         do {
-            let stages = zip(units, session.chain).map { Engine.Stage(unit: $0, bypass: $1.bypass, gainDb: $1.inputGainDb) }
-            engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
+            let stages = zip(units, session.chain).map {
+                Engine.Stage(unit: $0, bypass: $1.bypass, gainDb: $1.inputGainDb, isInstrument: $1.plugin.isInstrument)
+            }
+            let engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages,
+                                    bufferFrames: session.bufferFrames, midi: midi.fanout)
+            self.engine = engine
+            midi.active = engine.midiRingCount
+            midi.connect(session.input.midiSource)
             error = nil
+            hint = needsInstrument ? "Add an instrument to play MIDI into" : nil
             watchEngineDevices()
         } catch {
             self.error = error.localizedDescription
@@ -419,8 +473,10 @@ final class Model: ObservableObject {
     private func stop() {
         restartTask?.cancel()
         engine = nil
+        midi.connect("")
         awaitingDevice = false
         status.running = false  // keep the last readings so the status bar stays put, just grayed
+        hint = nil
         error = nil
     }
 
@@ -443,6 +499,10 @@ final class Model: ObservableObject {
     }
 
     private func pollLevels() {
+        let received = midi.received
+        midiQuietTicks = received != midiReceived ? 0 : midiQuietTicks + 1
+        midiReceived = received
+        if levels.midiActive != (midiQuietTicks < 3) { levels.midiActive.toggle() }
         guard let engine else {
             if !levels.peaks.isEmpty { levels.peaks = [:]; levels.reduction = [:] }
             return

@@ -26,6 +26,7 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudioKit"),
+                .linkedFramework("CoreMIDI"),
                 .linkedLibrary("sqlite3"),
             ]
         ),

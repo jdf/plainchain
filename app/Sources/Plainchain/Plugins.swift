@@ -1,22 +1,24 @@
 import AVFoundation
 import Foundation
 
-/// An installed Audio Unit effect.
+/// An installed Audio Unit effect or instrument.
 struct Plugin: Identifiable, Hashable {
     let id: PluginId
     let name: String
     let manufacturer: String
+    let isInstrument: Bool
 }
 
 enum Plugins {
-    /// Every installed effect (`aufx`) and music-effect (`aumf`) Audio Unit.
+    /// Every installed effect (`aufx`), music-effect (`aumf`), and instrument (`aumu`) Audio Unit.
     static func installed() -> [Plugin] {
         let manager = AVAudioUnitComponentManager.shared()
         var out: [Plugin] = []
-        for type in [kAudioUnitType_Effect, kAudioUnitType_MusicEffect] {
+        for type in [kAudioUnitType_Effect, kAudioUnitType_MusicEffect, kAudioUnitType_MusicDevice] {
             let wanted = AudioComponentDescription(componentType: type, componentSubType: 0, componentManufacturer: 0, componentFlags: 0, componentFlagsMask: 0)
             for c in manager.components(matching: wanted) {
-                out.append(Plugin(id: PluginId(c.audioComponentDescription), name: c.name, manufacturer: c.manufacturerName))
+                let id = PluginId(c.audioComponentDescription)
+                out.append(Plugin(id: id, name: c.name, manufacturer: c.manufacturerName, isInstrument: id.isInstrument))
             }
         }
         return out.sorted {

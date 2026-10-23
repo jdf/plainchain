@@ -33,6 +33,11 @@ struct PluginId: Hashable {
         manufacturer = FourCC.string(d.componentManufacturer)
     }
 
+    /// A music device (`aumu`): a chain head that turns MIDI into audio.
+    var isInstrument: Bool { type == "aumu" }
+    /// Instruments and music effects (`aumf`) are sent the session's MIDI input.
+    var receivesMidi: Bool { type == "aumu" || type == "aumf" }
+
     var description: AudioComponentDescription {
         AudioComponentDescription(
             componentType: FourCC.code(type), componentSubType: FourCC.code(subtype),
@@ -41,17 +46,26 @@ struct PluginId: Hashable {
     }
 }
 
-/// A device plus the zero-based device channels in use.
+/// A device plus the zero-based device channels in use. An input can be a
+/// MIDI source instead; the device and channels are kept so switching back
+/// to audio restores them.
 struct Endpoint: Equatable {
     var deviceUid: String
     var channels: [UInt32]
+    /// Input only: a CoreMIDI source's `kMIDIPropertyUniqueID` in decimal, or
+    /// "*" for every source. Non-empty means the input is MIDI.
+    var midiSource = ""
+    /// The source's display name when it was chosen, for showing it while it is gone.
+    var midiSourceName = ""
+
+    var isMidi: Bool { !midiSource.isEmpty }
 }
 
 struct ChainItem: Identifiable, Equatable {
     var id = UUID()
     var plugin: PluginId
     var bypass = false
-    /// Trim applied before the plugin, in dB.
+    /// Trim applied before the plugin, in dB; after it, for an instrument.
     var inputGainDb: Float = 0
     /// The plugin's `fullState`, as a binary plist. Only populated while saving or loading.
     var state: Data?

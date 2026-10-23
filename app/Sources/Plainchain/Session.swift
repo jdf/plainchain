@@ -8,11 +8,15 @@ import SQLite3
 ///     chain(position INTEGER PRIMARY KEY, message BLOB) -- a ChainItem per slot, in order
 ///     settings(message BLOB)                          -- one Settings row (absent in older files)
 ///
-/// `PRAGMA application_id` is 'PLCH' and `user_version` is the format version.
+/// `PRAGMA application_id` is 'PLCH' and `user_version` is the format version:
+/// 1 for audio input, 2 when the input is MIDI or the chain has an instrument
+/// (an older reader would take either for an audio session). A file is written with the lowest version
+/// that describes it, so audio sessions still open in older versions.
 enum SessionFile {
     static let fileExtension = "plainchain"
     static let applicationId: Int32 = 0x504C_4348  // 'PLCH'
-    static let formatVersion: Int32 = 1
+    /// The newest format this app reads and writes.
+    static let formatVersion: Int32 = 2
 
     static func read(_ url: URL) throws -> Session {
         let db = try DB(url, create: false)
@@ -54,7 +58,8 @@ enum SessionFile {
         try db.exec("BEGIN IMMEDIATE")
         do {
             try db.exec("PRAGMA application_id = \(applicationId)")
-            try db.exec("PRAGMA user_version = \(formatVersion)")
+            let needsMidi = session.input.isMidi || session.chain.contains { $0.plugin.isInstrument }
+            try db.exec("PRAGMA user_version = \(needsMidi ? formatVersion : 1)")
             try db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             try db.exec("CREATE TABLE endpoint (role TEXT PRIMARY KEY, message BLOB NOT NULL)")
             try db.exec("CREATE TABLE chain (position INTEGER PRIMARY KEY, message BLOB NOT NULL)")

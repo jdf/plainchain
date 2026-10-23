@@ -50,6 +50,8 @@ struct Reader {
 template <> void Reader<Endpoint>::validate() {
     root.getDeviceUid();
     root.getChannels();
+    root.getMidiSource();
+    root.getMidiSourceName();
 }
 
 template <> void Reader<Settings>::validate() { root.getBufferFrames(); }
@@ -67,12 +69,15 @@ extern "C" {
 
 void pc_buf_free(pc_buf buf) { std::free(buf.bytes); }
 
-pc_buf pc_endpoint_encode(const char *device_uid, const uint32_t *channels, size_t channel_count) {
+pc_buf pc_endpoint_encode(const char *device_uid, const uint32_t *channels, size_t channel_count,
+                          const char *midi_source, const char *midi_source_name) {
     capnp::MallocMessageBuilder message;
     Endpoint::Builder e = message.initRoot<Endpoint>();
     e.setDeviceUid(device_uid ? device_uid : "");
     auto list = e.initChannels(static_cast<unsigned>(channel_count));
     for (size_t i = 0; i < channel_count; i++) list.set(static_cast<unsigned>(i), channels[i]);
+    e.setMidiSource(midi_source ? midi_source : "");
+    e.setMidiSourceName(midi_source_name ? midi_source_name : "");
     return toBuf(message);
 }
 
@@ -82,6 +87,8 @@ pc_endpoint *pc_endpoint_read(const uint8_t *bytes, size_t len) {
 const char *pc_endpoint_device_uid(const pc_endpoint *e) { return e->root.getDeviceUid().cStr(); }
 size_t pc_endpoint_channel_count(const pc_endpoint *e) { return e->root.getChannels().size(); }
 uint32_t pc_endpoint_channel(const pc_endpoint *e, size_t i) { return e->root.getChannels()[static_cast<unsigned>(i)]; }
+const char *pc_endpoint_midi_source(const pc_endpoint *e) { return e->root.getMidiSource().cStr(); }
+const char *pc_endpoint_midi_source_name(const pc_endpoint *e) { return e->root.getMidiSourceName().cStr(); }
 void pc_endpoint_free(pc_endpoint *e) { delete e; }
 
 pc_buf pc_chain_item_encode(const char *id, const char *type, const char *subtype, const char *manufacturer,
