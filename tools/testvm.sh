@@ -10,7 +10,7 @@
 #
 # The guest is a clone of the tool's template, provisioned by
 # tools/provision-testvm.sh. To make it again, from ~/projects/testvm:
-#   ./testvm.sh create plainchain-tests --from testvm-template --cpu 2 --memory 4096 --display 1440x900
+#   ./testvm.sh create plainchain-tests --from testvm-template --cpu 2 --memory 4096
 #   ./testvm.sh provision plainchain-tests ~/projects/plainchain/tools/provision-testvm.sh
 #
 # Audio stays inside the guest only because the tool boots it with `--no-audio`
