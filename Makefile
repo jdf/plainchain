@@ -70,13 +70,13 @@ smoke: bundle
 
 # Device hot-plug recovery, in the Tart test VM (never on the host): a fake
 # interface (a public aggregate under a fixed UID) is unplugged and replugged
-# under a running session. tools/testvm.sh up/down manage the guest, through
-# the testvm repository's tool (~/projects/testvm).
+# under a running session. tools/testvm.sh up/down manage the guest,
+# plainchain-tests, through the testvm repository's tool (~/projects/testvm).
 hotplug-test: bundle
 	tools/testvm.sh hotplug
 
 # MIDI input, in the Tart test VM: a virtual MIDI source plays Apple's DLS synth
-# into the default output, by source, through "all sources", and through the
+# into BlackHole, by source, through "all sources", and through the
 # app's virtual destination (Plainchain --smoke with PC_MIDI=1).
 midi-test: bundle
 	tools/testvm.sh midi
