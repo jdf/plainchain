@@ -70,7 +70,8 @@ smoke: bundle
 
 # Device hot-plug recovery, in the Tart test VM (never on the host): a fake
 # interface (a public aggregate under a fixed UID) is unplugged and replugged
-# under a running session. tools/testvm.sh up/down manage the guest.
+# under a running session. tools/testvm.sh up/down manage the guest, through
+# the testvm repository's tool (~/projects/testvm).
 hotplug-test: bundle
 	tools/testvm.sh hotplug
 

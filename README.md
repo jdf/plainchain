@@ -31,7 +31,7 @@ Sessions (devices, chain, and every plugin's state) save to `.plainchain` files:
 | `app/Sources/Plainchain/ContentView.swift` | A session window's contents. |
 | `app/Sources/Plainchain/Smoke.swift` | Headless engine check (`--smoke`; with `PC_MIDI=1`, the MIDI check). |
 | `app/Sources/Plainchain/HotplugTest.swift` | Headless device hot-plug and two-session check (`--hotplug-test`), run in the test VM. |
-| `tools/testvm.sh` | Runs things in the Tart test VM: `push` the bundle, `run` a command, `hotplug`, `midi`. |
+| `tools/testvm.sh` | Runs things in the Tart test VM through the testvm repository's tool (`~/projects/testvm`, github.com/jdf/testvm): `up`/`down` the guest, `push` the bundle, `run` a command, `hotplug`, `midi`. |
 | `Makefile` | Builds and assembles `build/Plainchain.app`. |
 
 ## Build and run
@@ -72,7 +72,7 @@ The app listens for HAL device-list changes. When a session device disappears, o
 
 ### The test VM
 
-The guest is whatis's `whatis-tests` Tart VM, and it must be booted with `--no-audio` (whatis's `tools/testvm.sh up` does that): otherwise its "Apple Virtual Sound Device" passes straight through to the host's speakers and microphone. It must have the BlackHole 16ch loopback driver installed, and every audio test targets BlackHole by name (`PC_IN=BlackHole PC_OUT=BlackHole`, a name substring), never the default devices. BlackHole loops each output channel back into the same input channel, so the tests never write a channel they read: a session reads 1-2 and writes 3-4, and a second session writes 5-6. The nested-aggregate scenario stays best-effort: with BlackHole in both roles the private aggregate (the fake interface plus BlackHole) never reports the channel count the engine waits for ("has 16 output channels, not yet 20"), so the refusal is reported and not counted.
+The guest is the shared `whatis-tests` Tart VM, whose lifecycle belongs to the testvm repository, cloned at `~/projects/testvm` (or `TESTVM_DIR`); it must be booted with `--no-audio` (that tool's `up`, which `tools/testvm.sh up` runs, does that): otherwise its "Apple Virtual Sound Device" passes straight through to the host's speakers and microphone. It must have the BlackHole 16ch loopback driver installed, and every audio test targets BlackHole by name (`PC_IN=BlackHole PC_OUT=BlackHole`, a name substring), never the default devices. BlackHole loops each output channel back into the same input channel, so the tests never write a channel they read: a session reads 1-2 and writes 3-4, and a second session writes 5-6. The nested-aggregate scenario stays best-effort: with BlackHole in both roles the private aggregate (the fake interface plus BlackHole) never reports the channel count the engine waits for ("has 16 output channels, not yet 20"), so the refusal is reported and not counted.
 
 Effects are wired with `kAudioUnitProperty_MakeConnection`. The first effect's render callback pulls the current IO cycle's input straight from the HAL unit into the effect's own buffers, so there is no intermediate buffer and no added latency beyond the device's own.
 

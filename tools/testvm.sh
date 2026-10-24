@@ -1,105 +1,59 @@
 #!/bin/bash
 # Plainchain's tests that need real (fake) audio hardware run in a Tart macOS
 # guest, never on the host, where they would feed the live microphone into
-# the live speakers. The guest is whatis's `whatis-tests` VM: its lifecycle
-# (`up`, `down`) belongs to ~/projects/whatissoftware/tools/testvm.sh, and
-# this script only borrows it. The Plainchain tree is not shared into the
+# the live speakers. The guest is the shared `whatis-tests` VM, and its
+# lifecycle (`up`, `down`, `run`, booting it with `--no-audio`) belongs to the
+# testvm repository at ~/projects/testvm (github.com/jdf/testvm); this script
+# only adds Plainchain's steps. The Plainchain tree is not shared into the
 # guest, so `push` copies the built bundle to ~/Plainchain.app there.
 #
-# Audio stays inside the guest only if it is booted with `--no-audio` (whatis's
-# `up` does that; otherwise its "Apple Virtual Sound Device" passes through to
-# the host's speakers and microphone) and has the BlackHole 16ch loopback
-# driver installed. Every audio run here targets BlackHole by name
-# (PC_IN/PC_OUT, a name substring), never the default devices. BlackHole
-# loops each output channel back into the same input channel, so the tests
-# never write the channels they read: input 1-2, output 3-4 (and 5-6 for a
-# second session). The guest also needs a microphone grant for
-# com.plainchain.app in its TCC database: BlackHole's input counts as a microphone.
+# Audio stays inside the guest only because the tool boots it with `--no-audio`
+# (otherwise its "Apple Virtual Sound Device" passes through to the host's
+# speakers and microphone) and it has the BlackHole 16ch loopback driver
+# installed. Every audio run here targets BlackHole by name (PC_IN/PC_OUT, a
+# name substring), never the default devices. BlackHole loops each output
+# channel back into the same input channel, so the tests never write the
+# channels they read: input 1-2, output 3-4 (and 5-6 for a second session).
+# The guest also needs a microphone grant for com.plainchain.app in its TCC
+# database: BlackHole's input counts as a microphone.
 #
-#   tools/testvm.sh status
-#   tools/testvm.sh up | down            (delegated to whatis)
-#   tools/testvm.sh run [--aqua] <cmd...> (ssh into the guest; --aqua runs in the console user's GUI session)
+#   tools/testvm.sh status | up | down | ip  (the testvm tool's own)
+#   tools/testvm.sh run [--aqua] <cmd...>  (the tool's run; --aqua runs in the console user's GUI session)
 #   tools/testvm.sh push                 (build/Plainchain.app -> guest ~/Plainchain.app)
 #   tools/testvm.sh hotplug              (push, then Plainchain --hotplug-test in the Aqua session; exit status passed through)
 #   tools/testvm.sh midi                 (push, then PC_MIDI=1 Plainchain --smoke in the Aqua session; exit status passed through)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-vm=${TESTVM_NAME:-whatis-tests}
-whatis=${WHATIS_DIR:-$HOME/projects/whatissoftware}
-bundle=build/Plainchain.app
-
-tart_bin="$(command -v tart || true)"
-if [ -z "$tart_bin" ] && [ -x /opt/homebrew/bin/tart ]; then
-    tart_bin=/opt/homebrew/bin/tart
-fi
-if [ -z "$tart_bin" ]; then
-    echo "testvm: tart is not installed on this machine" >&2
+testvm=${TESTVM_DIR:-$HOME/projects/testvm}
+if [ ! -x "$testvm/testvm.sh" ]; then
+    echo "testvm: the testvm repository is not at $testvm; clone github.com/jdf/testvm there, or set TESTVM_DIR" >&2
     exit 1
 fi
-# Tart storage as whatis names it, so both scripts see the same VMs.
-if [ -z "${TART_HOME:-}" ] && [ -f "$whatis/.tart_home" ]; then
-    TART_HOME="$(head -n 1 "$whatis/.tart_home")"
-    export TART_HOME
-fi
-
-# The address comes from tart at each call (a clone draws a fresh DHCP
-# lease); the `tartvm` ssh host entry supplies the user and the key.
-guest_ip() {
-    "$tart_bin" ip "$vm" 2>/dev/null ||
-        "$tart_bin" ip "$vm" --resolver arp 2>/dev/null
-}
-
-ssh_opts=(-o ConnectTimeout=20)
-
-guest_ssh() {
-    local ip
-    ip="$(guest_ip)" || { echo "testvm: no address for $vm" >&2; return 1; }
-    ssh "${ssh_opts[@]}" -o "HostName $ip" tartvm "$@"
-}
-
-require_up() {
-    if ! "$tart_bin" get "$vm" --format json | grep -q '"State" *: *"running"'; then
-        echo "testvm: $vm is not running; tools/testvm.sh up first" >&2
-        exit 1
-    fi
-}
+bundle=build/Plainchain.app
 
 push() {
-    require_up
     if [ ! -d "$bundle" ]; then
         echo "testvm: $bundle is missing; make bundle first" >&2
         exit 1
     fi
+    # Replace the whole bundle: the signature seals every file in it. The
+    # tool's run refuses a guest that is not up, and runs in the guest user's
+    # home, where Plainchain.app lives.
+    "$testvm/testvm.sh" run rm -rf Plainchain.app
     local ip
-    ip="$(guest_ip)"
-    # Replace the whole bundle: the signature seals every file in it.
-    guest_ssh -n 'rm -rf ~/Plainchain.app'
-    rsync -a -e "ssh ${ssh_opts[*]} -o HostName=$ip" "$bundle/" "tartvm:Plainchain.app/"
-}
-
-# Every argument is quoted for the guest's shell.
-run() {
-    require_up
-    if [ "${1:-}" = --aqua ]; then
-        shift
-        [ "$#" -gt 0 ] || { echo "testvm: run --aqua needs a command" >&2; exit 2; }
-        # whatis's runner, fed to the guest's bash on stdin: it runs the
-        # command as a launchd job in the console user's Aqua session.
-        guest_ssh "bash -s -- $(printf '%q ' "$@")" < "$whatis/tools/run-in-aqua.sh"
-    else
-        [ "$#" -gt 0 ] || { echo "testvm: run needs a command" >&2; exit 2; }
-        guest_ssh -n "$(printf '%q ' "$@")"
-    fi
+    ip="$("$testvm/testvm.sh" ip)"
+    # The `tartvm` ssh host entry supplies the user and the key.
+    rsync -a -e "ssh -o ConnectTimeout=20 -o HostName=$ip" "$bundle/" "tartvm:Plainchain.app/"
 }
 
 case "${1:-status}" in
-status | up | down)
-    exec "$whatis/tools/testvm.sh" "$1"
+status | up | down | ip)
+    exec "$testvm/testvm.sh" "$1"
     ;;
 run)
     shift
-    run "$@"
+    exec "$testvm/testvm.sh" run "$@"
     ;;
 push)
     push
@@ -109,15 +63,15 @@ hotplug)
     push
     # In the console user's Aqua session: over plain ssh the HAL attributes the
     # microphone to sshd, not to Plainchain, and coreaudiod waits on a prompt.
-    run --aqua /usr/bin/env PC_IN=BlackHole PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --hotplug-test
+    exec "$testvm/testvm.sh" run --aqua /usr/bin/env PC_IN=BlackHole PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --hotplug-test
     ;;
 midi)
     shift
     push
-    run --aqua /usr/bin/env PC_MIDI=1 PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --smoke
+    exec "$testvm/testvm.sh" run --aqua /usr/bin/env PC_MIDI=1 PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --smoke
     ;;
 *)
-    echo "usage: tools/testvm.sh [status|up|down|push|hotplug|midi|run [--aqua] <command> [args...]]" >&2
+    echo "usage: tools/testvm.sh [status|up|down|ip|push|hotplug|midi|run [--aqua] <command> [args...]]" >&2
     exit 2
     ;;
 esac
