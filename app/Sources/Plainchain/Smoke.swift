@@ -1,11 +1,14 @@
 import AVFoundation
+import CapnSession
 import Combine
 import CoreMIDI
 import Foundation
 
 /// `Plainchain --smoke [PC_IN=name] [PC_OUT=name] [plugin names...]`
 /// Headless check: lists devices and plugins, builds the chain, runs it for
-/// two seconds, and round-trips a session file. Exits nonzero on failure.
+/// two seconds, round-trips a session file, runs the chain to None output
+/// (see `none`), and runs it with a MIDI source beside the device input (see
+/// `both`). Exits nonzero on failure.
 /// With `PC_MIDI=1` it checks MIDI input instead (see `midi`).
 enum Smoke {
     static func run() {
@@ -129,8 +132,123 @@ enum Smoke {
                 guard changes > 0 else { throw EngineError("a parameter change was not signalled") }
             }
         }
+        try none(devices, inp, units, chain)
+        try both(devices, inp, out, units, chain, instrument: try env["PC_INSTRUMENT"].map { n in
+            guard let p = plugins.first(where: { $0.isInstrument && ($0.name == n || $0.id.subtype == n) }) else { throw EngineError("no instrument \(n)") }
+            return p
+        })
         print("stopped cleanly")
         if env["PC_LISTEN"] != nil { try listen(out) }
+    }
+
+    /// Audio and MIDI together: a device input with a MIDI source builds and
+    /// runs, with a ring per plugin that takes MIDI (none of Apple's effects
+    /// do); Apple's DLS synth heads the chain beside the device input, which
+    /// it has no bus for, so the engine reports the audio input unused;
+    /// `instrument` (`PC_INSTRUMENT`, one with an input bus, such as a
+    /// vocoder) takes the device input on that bus; the session round-trips
+    /// at format version 4, and the same records under an older version read
+    /// as MIDI instead of audio.
+    private static func both(_ devices: [Device], _ inp: Device, _ out: Device, _ units: [PluginInstance], _ chain: [ChainItem], instrument: Plugin?) throws {
+        let input = Endpoint(deviceUid: inp.uid, channels: Array(0..<min(inp.inputChannels, 2)), midiSource: "*", midiSourceName: MidiInput.allSourcesName)
+        let outFirst: UInt32 = inp.uid == out.uid && out.outputChannels >= 4 ? 2 : 0
+        let output = Endpoint(deviceUid: out.uid, channels: Array(outFirst..<outFirst + min(out.outputChannels, 2)))
+        let fanout = pc_midi_fanout_new()!
+        do {
+            let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
+            let engine = try Engine(input: input, output: output, devices: devices, stages: stages, midi: fanout)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+            let s = engine.status
+            let receivers = units.filter { $0.id.type == "aumf" }.count
+            print("Audio and MIDI: \(inp.name) + MIDI -> \(chain.count) plugins -> \(out.name): rings \(engine.midiRingCount) for \(receivers) music effects, errors \(s.renderErrors)")
+            guard engine.midiRingCount == receivers, s.renderErrors == 0 else { throw EngineError("Audio and MIDI: the chain did not run with both") }
+        }
+        let dls = try wait { try await PluginInstance.make(PluginId(type: "aumu", subtype: "dls ", manufacturer: "appl")) }
+        do {
+            let stages = [Engine.Stage(unit: dls.audioUnit, bypass: false, gainDb: 0, isInstrument: true)]
+                + zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
+            let engine = try Engine(input: input, output: output, devices: devices, stages: stages, midi: fanout)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
+            let s = engine.status
+            print("Audio and MIDI: \(inp.name) + MIDI -> DLSMusicDevice -> \(chain.count) plugins -> \(out.name): rings \(engine.midiRingCount), audio input unused \(engine.audioInputUnused), errors \(s.renderErrors)")
+            guard engine.audioInputUnused, engine.midiRingCount == 1 + units.filter({ $0.id.type == "aumf" }).count, s.renderErrors == 0 else {
+                throw EngineError("Audio and MIDI: the DLS synth did not run beside the device input with it unused")
+            }
+        }
+        if let instrument {
+            // An instrument with an input bus: the device input goes into it.
+            let unit = try wait { try await PluginInstance.make(instrument.id) }
+            let engine = try Engine(input: input, output: output, devices: devices,
+                                    stages: [Engine.Stage(unit: unit.audioUnit, bypass: false, gainDb: 0, isInstrument: true, owner: unit)], midi: fanout)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 1))
+            let s = engine.status
+            print("Audio and MIDI: \(inp.name) + MIDI -> \(instrument.name) -> \(out.name): rings \(engine.midiRingCount), audio input unused \(engine.audioInputUnused), width \(s.width), errors \(s.renderErrors)")
+            guard !engine.audioInputUnused, engine.midiRingCount == 1, s.renderErrors == 0 else {
+                throw EngineError("Audio and MIDI: \(instrument.name) did not take the device input")
+            }
+        }
+        withExtendedLifetime(units) {}
+        withExtendedLifetime(dls) {}
+        let session = Session(input: input, output: output, chain: chain)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("smoke-both.plainchain")
+        try SessionFile.write(session, to: url)
+        var back = try SessionFile.read(url)
+        let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
+        print("Audio and MIDI session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
+        guard back == session, version == 4 else { throw EngineError("Audio and MIDI session did not round-trip at version 4") }
+        // The same records under an older version: a MIDI source then meant no audio input.
+        try DB(url, create: false).exec("PRAGMA user_version = 2")
+        back = try SessionFile.read(url)
+        print("  read as version 2: input \(back.input.isNone ? "None" : back.input.deviceUid), MIDI \(back.input.midiSource)")
+        guard back.input == .midi("*", name: MidiInput.allSourcesName) else { throw EngineError("a pre-4 MIDI session did not read as MIDI without audio") }
+    }
+
+    /// None output: the input device clocks a chain that goes nowhere. Then
+    /// None input too: with no device at all the timer clocks it, at its own
+    /// rate, and follows a buffer size change live. Neither may have render
+    /// errors. A None session round-trips at format version 3.
+    private static func none(_ devices: [Device], _ inp: Device, _ units: [PluginInstance], _ chain: [ChainItem]) throws {
+        let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
+        let input = Endpoint(deviceUid: inp.uid, channels: Array(0..<min(inp.inputChannels, 2)))
+        do {
+            let engine = try Engine(input: input, output: .none, devices: devices, stages: stages)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 1))
+            let s = engine.status
+            print("None output: \(inp.name) -> \(chain.count) plugins -> none: \(engine.sinkCycles) cycles in 1 s at \(s.bufferFrames) frames, "
+                + "errors \(s.renderErrors), output latency \(s.outputLatencyFrames)")
+            guard engine.sinkCycles > 0, s.renderErrors == 0, s.outputLatencyFrames == 0 else {
+                throw EngineError("None output: the input device did not pull the chain cleanly")
+            }
+        }
+        do {
+            let engine = try Engine(input: .none, output: .none, devices: devices, stages: stages)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 1))
+            let s = engine.status
+            let first = engine.sinkCycles
+            print("No device: none -> \(chain.count) plugins -> none: \(first) cycles in 1 s at \(s.bufferFrames) frames, \(Int(s.sampleRate)) Hz, errors \(s.renderErrors)")
+            func near(_ cycles: UInt64, _ frames: Int) -> Bool {
+                let expected = Engine.clockSampleRate / Double(frames)
+                return Double(cycles) > expected * 0.8 && Double(cycles) < expected * 1.2
+            }
+            guard s.sampleRate == Engine.clockSampleRate, s.bufferFrames == 512, s.width == 2, near(first, 512), s.renderErrors == 0 else {
+                throw EngineError("No device: the clock did not run at its rate")
+            }
+            try engine.setBufferSize(128)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 1))
+            let second = engine.sinkCycles - first
+            print("  at 128 frames: \(second) cycles in 1 s, errors \(engine.status.renderErrors)")
+            guard engine.status.bufferFrames == 128, near(second, 128), engine.status.renderErrors == 0 else {
+                throw EngineError("No device: the clock did not follow the buffer size")
+            }
+        }
+        withExtendedLifetime(units) {}
+        let session = Session(input: .none, output: .none, chain: chain)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("smoke-none.plainchain")
+        try SessionFile.write(session, to: url)
+        let back = try SessionFile.read(url)
+        let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
+        print("None session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
+        guard back == session, version == 3 else { throw EngineError("None session did not round-trip at version 3") }
     }
 
     /// `PC_MIDI=1`: a virtual MIDI source plays Apple's DLS synth, the chain
@@ -139,8 +257,9 @@ enum Smoke {
     /// unique ID, from "all sources", and through the app's virtual
     /// destination; the destination must be ignored while one source is
     /// selected. Two effects follow the synth; reordering them live (the
-    /// instrument stays at position 0) must keep the output sounding. Then a
-    /// MIDI session round-trips through a file.
+    /// instrument stays at position 0) must keep the output sounding. Then
+    /// the None endpoints, a MIDI source beside a device input, and a MIDI
+    /// session round-tripping through a file.
     private static func midi(_ devices: [Device], _ out: Device) throws {
         DispatchQueue.global().asyncAfter(deadline: .now() + 60) {
             print("FAIL: watchdog: MIDI smoke still running after 60 s")
@@ -163,7 +282,7 @@ enum Smoke {
         let units = try ids.map { id in try wait { try await PluginInstance.make(id) } }
         for u in units { print("  \(u.id.subtype): \(describe(u))") }
         let session = Session(
-            input: Endpoint(deviceUid: "", channels: [], midiSource: "\(sourceID)", midiSourceName: "Plainchain smoke"),
+            input: .midi("\(sourceID)", name: "Plainchain smoke"),
             output: Endpoint(deviceUid: out.uid, channels: Array(0..<min(out.outputChannels, 2))),
             chain: ids.map { ChainItem(plugin: $0) }
         )
@@ -251,20 +370,96 @@ enum Smoke {
             withExtendedLifetime(units) {}
         }
 
+        // No device at all: MIDI into the instrument, out to nothing; the timer clocks it.
+        do {
+            let engine = try Engine(input: session.input, output: .none, devices: devices,
+                                    stages: [Engine.Stage(unit: units[0].audioUnit, bypass: false, gainDb: 0, isInstrument: true)], midi: input.fanout)
+            input.active = engine.midiRingCount
+            input.connect("\(sourceID)")
+            run(0.3)
+            _ = engine.takePeaks(0); _ = engine.takePeaks(1)
+            send(noteOn, toDestination: false)
+            run(1)
+            let inst = engine.takePeaks(0), outp = engine.takePeaks(1)
+            send(noteOff, toDestination: false)
+            run(0.1)
+            input.active = 0
+            let s = engine.status
+            print(String(format: "MIDI with None output: %d cycles at %d frames, %d Hz, width %d, instrument peaks %@, sink peak %.3f, errors %d",
+                         engine.sinkCycles, s.bufferFrames, Int(s.sampleRate), s.width,
+                         inst.map { String(format: "%.3f", $0) }.joined(separator: "/"), outp.max() ?? 0, s.renderErrors))
+            guard s.sampleRate == Engine.clockSampleRate, s.width == 2, engine.sinkCycles > 0, (outp.max() ?? 0) > 0.01, s.renderErrors == 0 else {
+                throw EngineError("MIDI with None output: the note did not reach the sink")
+            }
+            withExtendedLifetime(units) {}
+        }
+
+        // None input with an instrument and no MIDI source: it has its ring, nothing feeds it, silence.
+        do {
+            let engine = try Engine(input: .none, output: session.output, devices: devices,
+                                    stages: [Engine.Stage(unit: units[0].audioUnit, bypass: false, gainDb: 0, isInstrument: true)], midi: input.fanout)
+            run(0.5)
+            let outp = engine.takePeaks(1)
+            print(String(format: "None input with an instrument: rings %d, output peak %.3f, errors %d", engine.midiRingCount, outp.max() ?? 0, engine.status.renderErrors))
+            guard engine.midiRingCount == 1, (outp.max() ?? 0) < 0.001, engine.status.renderErrors == 0 else {
+                throw EngineError("None input with an instrument: did not run silent")
+            }
+            withExtendedLifetime(units) {}
+        }
+
+        // A device input with a MIDI source: the effects run on the device, with no ring (none takes MIDI).
+        if out.inputChannels >= 2 {
+            let both = Endpoint(deviceUid: out.uid, channels: [0, 1], midiSource: "\(sourceID)", midiSourceName: "Plainchain smoke")
+            do {
+                let engine = try Engine(input: both, output: session.output, devices: devices,
+                                        stages: units.dropFirst().map { Engine.Stage(unit: $0.audioUnit, bypass: false, gainDb: 0) }, midi: input.fanout)
+                run(0.5)
+                print("Audio and MIDI: \(out.name) 1-2 + MIDI -> AUDelay -> AULowpass -> \(out.name): rings \(engine.midiRingCount), width \(engine.status.width), errors \(engine.status.renderErrors)")
+                guard engine.midiRingCount == 0, engine.status.width == 2, engine.status.renderErrors == 0 else {
+                    throw EngineError("Audio and MIDI: the effects did not run on the device")
+                }
+                withExtendedLifetime(units) {}
+            }  // torn down here, so the effects are free for the next graph
+            // The instrument at the head beside the device input: it has no input bus, so the
+            // device input is unused, but the MIDI still plays it through the effects.
+            let withInstrument = try Engine(input: both, output: session.output, devices: devices, stages: stages, midi: input.fanout)
+            input.active = withInstrument.midiRingCount
+            input.connect("\(sourceID)")
+            run(0.3)
+            _ = withInstrument.takePeaks(0); _ = withInstrument.takePeaks(ids.count)
+            send(noteOn, toDestination: false)
+            run(1)
+            let inst = withInstrument.takePeaks(0), outp = withInstrument.takePeaks(ids.count)
+            send(noteOff, toDestination: false)
+            run(0.1)
+            input.active = 0
+            print(String(format: "Audio and MIDI: %@ 1-2 + MIDI -> DLSMusicDevice -> AUDelay -> AULowpass: rings %d, audio input unused %@, width %d, instrument peak %.3f, output peak %.3f, errors %d",
+                         out.name, withInstrument.midiRingCount, withInstrument.audioInputUnused ? "yes" : "no", withInstrument.status.width,
+                         inst.max() ?? 0, outp.max() ?? 0, withInstrument.status.renderErrors))
+            guard withInstrument.midiRingCount == 1, withInstrument.audioInputUnused, withInstrument.status.width == 2,
+                  (inst.max() ?? 0) > 0.01, (outp.max() ?? 0) > 0.001, withInstrument.status.renderErrors == 0 else {
+                throw EngineError("Audio and MIDI: the instrument did not play beside the device input")
+            }
+            withExtendedLifetime(units) {}
+        } else {
+            print("Audio and MIDI: \(out.name) has no inputs; skipping the engine check")
+        }
+
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("smoke-midi.plainchain")
         try SessionFile.write(session, to: url)
         let back = try SessionFile.read(url)
         let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
         print("MIDI session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
         guard back == session, version == 2 else { throw EngineError("MIDI session did not round-trip") }
-        try MainActor.assumeIsolated { try midiModel(url, system: system, source: source, sourceID: sourceID, session: session) }
+        try MainActor.assumeIsolated { try midiModel(url, system: system, source: source, sourceID: sourceID, session: session, out: out) }
         print("PASS")
     }
 
-    /// The app model in MIDI mode: the empty-head hint, loading a MIDI session,
-    /// playing it, switching sources without a rebuild, and refused moves.
+    /// The app model with MIDI: the unused-MIDI hint, loading a MIDI session,
+    /// playing it, switching sources (and off) without a rebuild, refused
+    /// moves, the None endpoints, and a MIDI source beside a device input.
     @MainActor
-    private static func midiModel(_ url: URL, system: MidiSystem, source: MIDIEndpointRef, sourceID: Int32, session: Session) throws {
+    private static func midiModel(_ url: URL, system: MidiSystem, source: MIDIEndpointRef, sourceID: Int32, session: Session, out: Device) throws {
         func run(_ seconds: Double) { RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds)) }
         func until(_ what: String, _ seconds: Double, _ ok: () -> Bool) throws {
             let deadline = Date(timeIntervalSinceNow: seconds)
@@ -283,8 +478,8 @@ enum Smoke {
         }
         let model = Model(app: AppState(ephemeral: true, midi: system), ephemeral: true)
         model.update { $0.output = session.output; $0.input.midiSource = "\(sourceID)"; $0.input.midiSourceName = "Plainchain smoke" }
-        try until("no instrument hint", 3) { model.status.running && model.error == nil && model.hint == "Add an instrument to play MIDI into" }
-        print("model: MIDI input with no instrument runs silent with the hint")
+        try until("unused MIDI hint", 3) { model.status.running && model.error == nil && model.hint == Model.midiUnusedHint }
+        print("model: a MIDI source with nothing to play runs with the hint (audio input \(model.session.input.isDevice ? "device" : "None"))")
 
         try wait { await model.open(url, quietly: false) }
         try until("MIDI session running", 3) { model.status.running && model.error == nil && model.hint == nil && model.session.chain.count == 3 }
@@ -323,8 +518,8 @@ enum Smoke {
         print("model: moves that displace the instrument refused; effects reorder")
 
         model.remove(at: [0])
-        try until("instrument removed", 3) { model.session.chain.count == 2 && model.hint == "Add an instrument to play MIDI into" && model.session.input.isMidi }
-        print("model: removing the instrument leaves MIDI input with an empty head")
+        try until("instrument removed", 3) { model.session.chain.count == 2 && model.hint == Model.midiUnusedHint && model.session.input.hasMidi }
+        print("model: removing the instrument leaves the MIDI source unused, with the hint")
         try wait { await model.open(url, quietly: false) }
         try until("MIDI session reloaded", 3) { model.status.running && model.session.chain.count == 3 && !model.dirty }
         run(0.5)  // let any plugin notifications from loading state and building the graph arrive
@@ -345,6 +540,88 @@ enum Smoke {
             try until("a parameter change marks the session edited", 2) { model.dirty && model.needsSavePrompt }
             print("model: changing \(effect.id.subtype) '\(p.name)' marked the session edited")
         }
+
+        // MIDI off under None input: no rebuild, the instrument stays (it runs on its own), and the
+        // picker still offers only effects; once the instrument is gone the head is open to either kind.
+        var offFlips = 0
+        let offWatch = model.$status.map(\.running).removeDuplicates().dropFirst().sink { _ in offFlips += 1 }
+        model.update { $0.input.midiSource = ""; $0.input.midiSourceName = "" }
+        run(0.5)
+        offWatch.cancel()
+        guard offFlips == 0, model.status.running, model.error == nil, model.hint == nil, !model.hasMidi, model.session.input.isNone else {
+            throw EngineError("model: MIDI off: flips \(offFlips), running \(model.status.running), hint \(model.hint ?? "nil"), MIDI \(model.hasMidi)")
+        }
+        guard model.session.chain.count == 3, !model.offersInstruments, model.chainWidth == 2 else {
+            throw EngineError("model: None input with an instrument offers instruments \(model.offersInstruments), width \(model.chainWidth)")
+        }
+        model.remove(at: [0])
+        try until("instrument removed under None input", 3) { model.session.chain.count == 2 && model.status.running && model.error == nil }
+        guard model.offersInstruments, model.hint == nil else {
+            throw EngineError("model: None input with an open head offers instruments \(model.offersInstruments), hint \(model.hint ?? "nil")")
+        }
+        print("model: MIDI off is no rebuild and keeps the instrument; with the head open under None input the picker offers instruments")
+        // None output too: no device at all.
+        model.update { $0.output = .none }
+        // BlackHole runs at the clock's rate too, so the clock's own buffer list is what tells the new engine from the old.
+        try until("no device running", 3) { model.status.running && model.error == nil && model.bufferSizeChoices == Engine.clockBufferChoices }
+        guard model.status.sampleRate == Engine.clockSampleRate else { throw EngineError("model: no device: sample rate \(model.status.sampleRate)") }
+        run(0.5)
+        guard model.status.renderErrors == 0 else { throw EngineError("model: no device: \(model.status.renderErrors) render errors") }
+        print("model: None in and out runs on the timer at \(Int(model.status.sampleRate)) Hz, buffer \(model.status.bufferFrames), no errors")
+
+        // Audio and MIDI together: a device input with a MIDI source. Nothing in the chain takes
+        // MIDI (two effects), so the hint says so, but the activity light still shows the notes;
+        // MIDI off is no rebuild; an instrument added beside the device input plays, with the
+        // device input unused (the DLS synth has no input bus) and the hint saying so.
+        model.update {
+            $0.input = Endpoint(deviceUid: out.uid, channels: [0, 1], midiSource: "\(sourceID)", midiSourceName: "Plainchain smoke")
+            $0.output = session.output
+        }
+        try until("audio and MIDI running", 3) {
+            model.status.running && model.error == nil && model.status.deviceName == out.name && model.hint == Model.midiUnusedHint
+        }
+        guard model.hasMidi, model.session.input.isDevice, model.offersInstruments, model.chainWidth == 2 else {
+            throw EngineError("model: audio and MIDI: MIDI \(model.hasMidi), device \(model.session.input.isDevice), offers instruments \(model.offersInstruments), width \(model.chainWidth)")
+        }
+        send(0x2090_3C64)
+        try until("MIDI light beside a device input", 2) { model.levels.midiActive }
+        send(0x2080_3C00)
+        run(0.5)
+        guard model.status.renderErrors == 0 else { throw EngineError("model: audio and MIDI: \(model.status.renderErrors) render errors") }
+        var bothFlips = 0
+        let bothWatch = model.$status.map(\.running).removeDuplicates().dropFirst().sink { _ in bothFlips += 1 }
+        model.update { $0.input.midiSource = ""; $0.input.midiSourceName = "" }
+        run(0.3)
+        bothWatch.cancel()
+        guard bothFlips == 0, model.status.running, model.hint == nil, !model.hasMidi, model.session.input.isDevice else {
+            throw EngineError("model: MIDI off beside a device input: flips \(bothFlips), hint \(model.hint ?? "nil"), MIDI \(model.hasMidi)")
+        }
+        print("model: a device input with a MIDI source runs on \(out.name) with the unused-MIDI hint and a live activity light; MIDI off is no rebuild")
+        guard let dls = model.plugins.first(where: { $0.id.subtype == "dls " && $0.id.manufacturer == "appl" }) else { throw EngineError("model: DLSMusicDevice not installed") }
+        model.add(dls)
+        try until("instrument added beside a device input", 5) {
+            model.session.chain.count == 3 && model.status.running && model.error == nil && model.hint == Model.audioUnusedHint(dls.name)
+        }
+        guard model.hasInstrument, !model.offersInstruments, model.hasMidi, model.session.input.isDevice, model.chainWidth == 2 else {
+            throw EngineError("model: instrument beside a device input: MIDI \(model.hasMidi), offers instruments \(model.offersInstruments), width \(model.chainWidth)")
+        }
+        let added = model.session.chain[0].id
+        _ = model.levels.peaks[added]
+        send(0x2090_3C64)
+        try until("instrument plays beside a device input", 3) { (model.levels.peaks[added]?.max() ?? 0) > 0.01 }
+        send(0x2080_3C00)
+        run(0.3)
+        guard model.status.renderErrors == 0 else { throw EngineError("model: instrument beside a device input: \(model.status.renderErrors) render errors") }
+        // MIDI off again: still no rebuild, and the hint about the unused audio input stays.
+        var addedFlips = 0
+        let addedWatch = model.$status.map(\.running).removeDuplicates().dropFirst().sink { _ in addedFlips += 1 }
+        model.update { $0.input.midiSource = ""; $0.input.midiSourceName = "" }
+        run(0.3)
+        addedWatch.cancel()
+        guard addedFlips == 0, model.status.running, model.hint == Model.audioUnusedHint(dls.name), !model.hasMidi else {
+            throw EngineError("model: MIDI off with an instrument beside a device input: flips \(addedFlips), hint \(model.hint ?? "nil")")
+        }
+        print("model: an instrument added beside a device input plays, with the hint \"\(model.hint ?? "")\"; MIDI off is no rebuild and keeps it")
         model.enabled = false
         run(0.2)
     }

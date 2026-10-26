@@ -46,19 +46,35 @@ struct PluginId: Hashable {
     }
 }
 
-/// A device plus the zero-based device channels in use. An input can be a
-/// MIDI source instead; the device and channels are kept so switching back
-/// to audio restores them.
+/// An audio device plus the zero-based device channels in use, or the "None"
+/// pseudo-device. The input endpoint also carries the session's MIDI source,
+/// which is independent of its audio side: either can be on or off.
 struct Endpoint: Equatable {
+    /// The pseudo-device that means no audio device: an input that feeds the
+    /// chain no audio, or an output that goes nowhere.
+    static let noneUid = "com.plainchain.none"
+
     var deviceUid: String
     var channels: [UInt32]
-    /// Input only: a CoreMIDI source's `kMIDIPropertyUniqueID` in decimal, or
-    /// "*" for every source. Non-empty means the input is MIDI.
+    /// Input only: a CoreMIDI source's `kMIDIPropertyUniqueID` in decimal,
+    /// "*" for every source, or "" for no MIDI.
     var midiSource = ""
     /// The source's display name when it was chosen, for showing it while it is gone.
     var midiSourceName = ""
 
-    var isMidi: Bool { !midiSource.isEmpty }
+    static let none = Endpoint(deviceUid: noneUid, channels: [])
+
+    /// No audio, MIDI from `source`.
+    static func midi(_ source: String, name: String) -> Endpoint {
+        Endpoint(deviceUid: noneUid, channels: [], midiSource: source, midiSourceName: name)
+    }
+
+    /// Input only: a MIDI source is chosen.
+    var hasMidi: Bool { !midiSource.isEmpty }
+    /// "None": no audio device (an input may still have MIDI).
+    var isNone: Bool { deviceUid == Self.noneUid }
+    /// An audio device, present or not.
+    var isDevice: Bool { !isNone }
 }
 
 struct ChainItem: Identifiable, Equatable {

@@ -64,7 +64,8 @@ dist: notarize
 	@echo "ready: $(ZIP)"
 
 # Headless engine check: default in -> chain -> default out for 2 s, then a session round trip.
-# PC_IN / PC_OUT select devices by name substring; PLUGINS lists plugin names.
+# PC_IN / PC_OUT select devices by name substring; PLUGINS lists plugin names;
+# PC_INSTRUMENT names an instrument with an input bus (a vocoder) to run on the device input.
 smoke: bundle
 	"$(BUNDLE)/Contents/MacOS/$(APP)" --smoke $(PLUGINS)
 

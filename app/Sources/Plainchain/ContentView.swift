@@ -28,11 +28,12 @@ struct EndpointView: View {
     private var endpoint: Endpoint { kind == .input ? model.session.input : model.session.output }
     private var device: Device? { model.device(uid: endpoint.deviceUid) }
     private var channelCount: Int { Int(kind == .input ? device?.inputChannels ?? 0 : device?.outputChannels ?? 0) }
-    private var isMidi: Bool { kind == .input && endpoint.isMidi }
-    private static let midiTag = "midi:"
-    /// A single MIDI source that is not connected right now.
-    private var midiSourceMissing: Bool {
-        isMidi && endpoint.midiSource != "*" && !model.midiSources.contains { "\($0.uniqueID)" == endpoint.midiSource }
+    private var isNone: Bool { endpoint.isNone }
+    /// What None means here, under the picker.
+    private var noneText: String {
+        if kind == .input { return "No audio input: an instrument at the head plays on its own; an effect there gets silence" }
+        return model.session.input.isDevice ? "No output; the input device clocks the chain"
+            : "No output; a timer clocks the chain at \(Int(Engine.clockSampleRate / 1000)) kHz"
     }
 
     private func set(_ mutate: (inout Endpoint) -> Void) {
@@ -45,59 +46,40 @@ struct EndpointView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
             VStack(alignment: .leading, spacing: 8) {
-                // Tags are device UIDs, or "midi:" plus a MIDI source selection for the input.
+                // Tags are device UIDs, None included. The input's MIDI source is a separate choice below.
                 Picker("Device", selection: Binding(
-                    get: { isMidi ? Self.midiTag + endpoint.midiSource : endpoint.deviceUid },
+                    get: { endpoint.deviceUid },
                     set: { tag in
-                        if tag.hasPrefix(Self.midiTag) {
-                            let source = String(tag.dropFirst(Self.midiTag.count))
-                            let name = source == "*" ? MidiInput.allSourcesName
-                                : model.midiSources.first { "\($0.uniqueID)" == source }?.name ?? endpoint.midiSourceName
-                            set { $0.midiSource = source; $0.midiSourceName = name }
-                            return
-                        }
                         let n = kind == .input ? model.device(uid: tag)?.inputChannels : model.device(uid: tag)?.outputChannels
                         set { ep in
-                            // Back from MIDI to the same device: keep its channels.
-                            if !(ep.isMidi && ep.deviceUid == tag && !ep.channels.isEmpty) {
-                                ep.deviceUid = tag
-                                ep.channels = Array(0..<min(n ?? 0, 2))
-                            }
-                            ep.midiSource = ""
-                            ep.midiSourceName = ""
+                            ep.deviceUid = tag
+                            ep.channels = tag == Endpoint.noneUid ? [] : Array(0..<min(n ?? 0, 2))
                         }
                     }
                 )) {
-                    if device == nil, !endpoint.deviceUid.isEmpty, !isMidi {
+                    Text("None").tag(Endpoint.noneUid)
+                    if device == nil, !endpoint.deviceUid.isEmpty, !isNone {
                         Text("(disconnected)").tag(endpoint.deviceUid)
                     }
                     ForEach(devices) { d in
                         Text("\(d.name)  ·  \(Int(d.sampleRate)) Hz").tag(d.uid)
                     }
-                    if kind == .input {
-                        Section("MIDI") {
-                            Text(MidiInput.allSourcesName).tag(Self.midiTag + "*")
-                            ForEach(model.midiSources) { m in
-                                Text(m.name).tag(Self.midiTag + "\(m.uniqueID)")
-                            }
-                            if midiSourceMissing {
-                                Text("\(endpoint.midiSourceName) (disconnected)").tag(Self.midiTag + endpoint.midiSource)
-                            }
-                        }
-                    }
                 }
                 .labelsHidden()
 
-                if isMidi {
-                    MidiActivity(text: midiSourceMissing ? "Waiting for \(endpoint.midiSourceName)…"
-                        : endpoint.midiSource == "*" ? "Listening to all MIDI sources and the “\(MidiInput.destinationName)” virtual destination"
-                        : "Listening to \(endpoint.midiSourceName)")
+                if isNone {
+                    Text(noneText).foregroundStyle(.secondary).lineLimit(1)
+                        .frame(minHeight: 22)  // the channel buttons' height, so the box keeps its size
                 } else if channelCount > 0 {
                     ChannelGrid(count: channelCount, selected: endpoint.channels) { ch, on in
                         set { ep in
                             if on { ep.channels.append(ch); ep.channels.sort() } else { ep.channels.removeAll { $0 == ch } }
                         }
                     }
+                }
+
+                if kind == .input {
+                    MidiRow(endpoint: endpoint) { source, name in set { $0.midiSource = source; $0.midiSourceName = name } }
                 }
             }
             .padding(8)
@@ -108,20 +90,56 @@ struct EndpointView: View {
     }
 }
 
-/// Where MIDI comes from, with a light that blinks as events arrive.
-struct MidiActivity: View {
+/// The input's MIDI source, independent of its audio device: none, every
+/// source, or one of them; with a light that blinks as events arrive.
+struct MidiRow: View {
+    @EnvironmentObject private var model: Model
     @EnvironmentObject private var levels: Levels
-    let text: String
+    let endpoint: Endpoint
+    /// Called with the chosen source selection and its display name.
+    let choose: (String, String) -> Void
+
+    /// A single MIDI source that is not connected right now.
+    private var missing: Bool {
+        endpoint.hasMidi && endpoint.midiSource != "*" && !model.midiSources.contains { "\($0.uniqueID)" == endpoint.midiSource }
+    }
+
+    private var text: String {
+        if missing { return "Waiting for \(endpoint.midiSourceName)…" }
+        if endpoint.midiSource == "*" { return "Every source and the “\(MidiInput.destinationName)” virtual destination" }
+        return ""
+    }
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(levels.midiActive ? Color.green : Color(nsColor: .quaternaryLabelColor))
-                .frame(width: 8, height: 8)
-                .help("MIDI activity")
-            Text(text).foregroundStyle(.secondary).lineLimit(1)
+        HStack(spacing: 8) {
+            Text("MIDI").foregroundStyle(.secondary)
+            Picker("MIDI", selection: Binding(
+                get: { endpoint.midiSource },
+                set: { source in
+                    let name = source == "*" ? MidiInput.allSourcesName
+                        : model.midiSources.first { "\($0.uniqueID)" == source }?.name ?? endpoint.midiSourceName
+                    choose(source, source.isEmpty ? "" : name)
+                }
+            )) {
+                Text("None").tag("")
+                Text(MidiInput.allSourcesName).tag("*")
+                ForEach(model.midiSources) { m in
+                    Text(m.name).tag("\(m.uniqueID)")
+                }
+                if missing {
+                    Text("\(endpoint.midiSourceName) (disconnected)").tag(endpoint.midiSource)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+            if endpoint.hasMidi {
+                Circle()
+                    .fill(levels.midiActive ? Color.green : Color(nsColor: .quaternaryLabelColor))
+                    .frame(width: 8, height: 8)
+                    .help("MIDI activity")
+                Text(text).foregroundStyle(.secondary).lineLimit(1)
+            }
         }
-        .frame(minHeight: 22)  // the channel buttons' height, so the box keeps its size
     }
 }
 
@@ -178,7 +196,7 @@ struct ChainView: View {
                     Label("Add", systemImage: "plus")
                 }
                 .popover(isPresented: $showingPicker, arrowEdge: .bottom) {
-                    PluginPicker(instruments: model.needsInstrument) { model.add($0); showingPicker = false }
+                    PluginPicker(instruments: model.offersInstruments) { model.add($0); showingPicker = false }
                         .onAppear { model.refreshPlugins() }
                 }
             }
@@ -224,10 +242,6 @@ struct ChainList: View {
 
     var body: some View {
         VStack(spacing: Self.rowSpacing) {
-            if model.needsInstrument {
-                EmptySlot(title: "Add an instrument", help: "MIDI input plays the instrument at the head of the chain", action: addAction)
-                    .slot(empty: true)
-            }
             ForEach(Array(model.session.chain.enumerated()), id: \.element.id) { index, item in
                 ChainRow(index: index, item: item, handle: handleGesture(index))
                     .slot()
@@ -236,10 +250,8 @@ struct ChainList: View {
                     .shadow(color: .black.opacity(dragIndex == index ? 0.25 : 0), radius: 6, y: 2)
                     .animation(.easeOut(duration: 0.15), value: dragIndex == index ? 0 : offset(for: index))
             }
-            if !model.needsInstrument {
-                EmptySlot(action: addAction)
-                    .slot(empty: true)
-            }
+            EmptySlot(action: addAction)
+                .slot(empty: true)
         }
     }
 
@@ -261,20 +273,18 @@ struct ChainList: View {
 
 /// The next place a plugin will go.
 struct EmptySlot: View {
-    var title = "Empty slot"
-    var help = "Add a plugin here"
     let action: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "plus.circle.dashed").foregroundStyle(.tertiary)
-            Text(title).foregroundStyle(.tertiary)
+            Text("Empty slot").foregroundStyle(.tertiary)
             Spacer()
         }
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
         .onTapGesture(perform: action)
-        .help(help)
+        .help("Add a plugin here")
     }
 }
 
@@ -308,7 +318,7 @@ struct ChainRow<Handle: Gesture>: View {
                 Image(systemName: "pianokeys")
                     .foregroundStyle(.secondary)
                     .frame(width: 20, height: ChainList.rowHeight)
-                    .help("Instrument, played by the MIDI input")
+                    .help(model.hasMidi ? "Instrument, played by the MIDI input" : "Instrument; with no MIDI input it runs on its own")
             } else {
                 Image(systemName: "line.3.horizontal")
                     .foregroundStyle(.secondary)
@@ -541,11 +551,12 @@ struct PluginPicker: View {
     @EnvironmentObject private var model: Model
     @State private var query = ""
     @State private var scanning = false
-    /// Instruments only (for an empty MIDI chain head), or effects only.
+    /// Whether instruments are offered too (while the chain head is open to one); effects always are.
     let instruments: Bool
     let choose: (Plugin) -> Void
 
-    private var offered: [Plugin] { model.plugins.filter { $0.isInstrument == instruments } }
+    private var offered: [Plugin] { model.plugins.filter { instruments || !$0.isInstrument } }
+    private var kind: String { instruments ? "plugins" : "effects" }
 
     private func rescan() {
         scanning = true
@@ -567,7 +578,7 @@ struct PluginPicker: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
-                TextField(instruments ? "Search instruments" : "Search plugins", text: $query)
+                TextField("Search plugins", text: $query)
                     .textFieldStyle(.roundedBorder)
                 if scanning {
                     ProgressView().controlSize(.small).frame(width: 20)
@@ -592,7 +603,7 @@ struct PluginPicker: View {
                 }
             }
             .listStyle(.inset)
-            Text(scanning ? "Scanning…" : "\(offered.count) \(instruments ? "instruments" : "effects") installed")
+            Text(scanning ? "Scanning…" : "\(offered.count) \(kind) installed")
                 .font(.caption).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 10).padding(.vertical, 5)

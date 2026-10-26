@@ -40,7 +40,7 @@ final class Model: ObservableObject {
     private var autosaveStale = true
     @Published private(set) var busy = false
     let levels = Levels()
-    /// MIDI input; its rings feed the engine in MIDI mode, and it costs nothing otherwise.
+    /// MIDI input; its rings feed the engine's instrument and music effects, and it costs nothing otherwise.
     let midi: MidiInput
     /// The window showing this session, once it is on screen.
     private(set) weak var window: NSWindow?
@@ -141,12 +141,13 @@ final class Model: ObservableObject {
     /// Wait for the session the window opened with to finish loading.
     func restored() async { await restoreTask?.value }
 
+    /// The default devices (or any with channels in the right direction); None where there is no device at all.
     private static func defaultSession(_ devices: [Device]) -> Session {
         let inp = devices.first { $0.defaultInput } ?? devices.first { $0.inputChannels > 0 }
         let out = devices.first { $0.defaultOutput } ?? devices.first { $0.outputChannels > 0 }
         return Session(
-            input: Endpoint(deviceUid: inp?.uid ?? "", channels: Array(0..<min(inp?.inputChannels ?? 0, 2))),
-            output: Endpoint(deviceUid: out?.uid ?? "", channels: Array(0..<min(out?.outputChannels ?? 0, 2)))
+            input: inp.map { Endpoint(deviceUid: $0.uid, channels: Array(0..<min($0.inputChannels, 2))) } ?? .none,
+            output: out.map { Endpoint(deviceUid: $0.uid, channels: Array(0..<min($0.outputChannels, 2))) } ?? .none
         )
     }
 
@@ -159,12 +160,23 @@ final class Model: ObservableObject {
     var outputDevices: [Device] { devices.filter { $0.outputChannels > 0 } }
     func device(uid: String) -> Device? { devices.first { $0.uid == uid } }
     func plugin(_ id: PluginId) -> Plugin? { plugins.first { $0.id == id } }
-    var isMidi: Bool { session.input.isMidi }
+    var hasMidi: Bool { session.input.hasMidi }
     var hasInstrument: Bool { session.chain.first?.plugin.isInstrument == true }
-    /// MIDI input with nothing to play it: the head slot waits for an instrument.
-    var needsInstrument: Bool { isMidi && !hasInstrument }
+    /// The picker offers instruments while the head is open to one.
+    var offersInstruments: Bool { !hasInstrument }
+    /// A MIDI source is chosen and nothing in the chain takes MIDI.
+    var midiUnused: Bool { hasMidi && !session.chain.contains { $0.plugin.receivesMidi } }
+    /// What the status bar says about a chosen input that nothing takes; nil when both go somewhere.
+    private var inputHint: String? {
+        if midiUnused { return Self.midiUnusedHint }
+        if engine?.audioInputUnused == true, let head = session.chain.first { return Self.audioUnusedHint(name(of: head.plugin)) }
+        return nil
+    }
     /// Channels flowing through the chain.
-    var chainWidth: Int { isMidi ? (session.output.channels.count >= 2 ? 2 : 1) : session.input.channels.count }
+    var chainWidth: Int {
+        if session.input.isDevice { return session.input.channels.count }
+        return session.output.isNone || session.output.channels.count >= 2 ? 2 : 1
+    }
     func name(of id: PluginId) -> String { plugin(id)?.name ?? "\(id.manufacturer) \(id.subtype)" }
     func isEditorOpen(_ id: UUID) -> Bool { editors[id] != nil }
     /// The loaded plugin for a chain item (for the headless checks).
@@ -176,16 +188,17 @@ final class Model: ObservableObject {
         var next = session
         mutate(&next)
         guard next != session else { return }
-        // Another MIDI source in MIDI mode: reconnect, no rebuild.
+        // Only the MIDI source changed (to another, to none, or from none): reconnect, no rebuild.
         var sameButSource = next
         sameButSource.input.midiSource = session.input.midiSource
         sameButSource.input.midiSourceName = session.input.midiSourceName
-        if sameButSource == session, next.input.isMidi, session.input.isMidi {
+        if sameButSource == session {
             session = next
             markDirty()
             if enabled {
                 midi.releaseAll()
                 midi.connect(next.input.midiSource)
+                if engine != nil { hint = inputHint }
             }
             return
         }
@@ -245,9 +258,9 @@ final class Model: ObservableObject {
                 register(unit, for: item.id)
                 update { s in
                     guard plugin.isInstrument else { s.chain.append(item); return }
-                    // An instrument heads the chain and needs MIDI input.
+                    // An instrument heads the chain, played by every MIDI source unless one is chosen already.
                     s.chain.insert(item, at: 0)
-                    if !s.input.isMidi { s.input.midiSource = "*"; s.input.midiSourceName = MidiInput.allSourcesName }
+                    if !s.input.hasMidi { s.input.midiSource = "*"; s.input.midiSourceName = MidiInput.allSourcesName }
                 }
                 // Some plugins only offer their view once initialized, so wait for the rebuild.
                 await restartTask?.value
@@ -316,10 +329,10 @@ final class Model: ObservableObject {
     private var inputName: String { app.deviceNames[session.input.deviceUid] ?? "input device" }
     private var outputName: String { app.deviceNames[session.output.deviceUid] ?? "output device" }
 
-    /// The name of a session device that is not connected, if any. A MIDI input has no device.
+    /// The name of a session device that is not connected, if any. A None endpoint has no device.
     private var missingDevice: String? {
-        if !isMidi, device(uid: session.input.deviceUid) == nil { return inputName }
-        if device(uid: session.output.deviceUid) == nil { return outputName }
+        if session.input.isDevice, device(uid: session.input.deviceUid) == nil { return inputName }
+        if session.output.isDevice, device(uid: session.output.deviceUid) == nil { return outputName }
         return nil
     }
 
@@ -338,9 +351,9 @@ final class Model: ObservableObject {
     func devicesChanged() {
         guard !loading, !closed else { return }  // `load` restarts on its own when it is done
         if let engine {
-            if !isMidi, device(uid: session.input.deviceUid)?.id != engine.inputDevice {
+            if session.input.isDevice, device(uid: session.input.deviceUid)?.id != engine.inputDevice {
                 awaitDevice(inputName)
-            } else if device(uid: session.output.deviceUid)?.id != engine.outputDevice {
+            } else if session.output.isDevice, device(uid: session.output.deviceUid)?.id != engine.outputDevice {
                 awaitDevice(outputName)
             }
         }
@@ -351,7 +364,7 @@ final class Model: ObservableObject {
     /// back under the same object id is still noticed.
     private func watchEngineDevices() {
         guard let engine else { return }
-        aliveListeners = Set([engine.inputDevice, engine.outputDevice]).compactMap { id in
+        aliveListeners = Set([engine.inputDevice, engine.outputDevice]).subtracting([0]).compactMap { id in
             try? HAL.listen(id, kAudioDevicePropertyDeviceIsAlive) { [weak self] in Task { @MainActor in self?.aliveChanged(id) } }
         }
     }
@@ -525,6 +538,9 @@ final class Model: ObservableObject {
         }
     }
 
+    static let midiUnusedHint = "Add an instrument or music effect to play MIDI into"
+    static func audioUnusedHint(_ instrument: String) -> String { "\(instrument) takes no audio; the audio input is unused" }
+
     private func restart() {
         guard !closed else { return }
         engine = nil
@@ -545,7 +561,7 @@ final class Model: ObservableObject {
             midi.active = engine.midiRingCount
             midi.connect(session.input.midiSource)
             error = loadNotice
-            hint = needsInstrument ? "Add an instrument to play MIDI into" : nil
+            hint = inputHint
             watchEngineDevices()
         } catch {
             self.error = error.localizedDescription

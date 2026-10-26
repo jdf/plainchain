@@ -146,7 +146,7 @@ enum HotplugTest {
         // writes 3-4, B writes 5-6. On BlackHole A's input is then digital silence throughout.
         try load(a, Session(input: Endpoint(deviceUid: fakeUid, channels: [0, 1]), output: Endpoint(deviceUid: fakeUid, channels: [2, 3]),
                             chain: [ChainItem(plugin: delay)]))
-        try load(b, Session(input: Endpoint(deviceUid: "", channels: [], midiSource: "*", midiSourceName: MidiInput.allSourcesName),
+        try load(b, Session(input: .midi("*", name: MidiInput.allSourcesName),
                             output: Endpoint(deviceUid: subdevices.output.uid, channels: [4, 5]), chain: [ChainItem(plugin: dls)]))
         _ = try waitFor("both running", 5) {
             a.status.running && a.error == nil && a.status.deviceName == fakeName

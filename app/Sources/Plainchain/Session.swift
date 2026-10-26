@@ -9,14 +9,29 @@ import SQLite3
 ///     settings(message BLOB)                          -- one Settings row (absent in older files)
 ///
 /// `PRAGMA application_id` is 'PLCH' and `user_version` is the format version:
-/// 1 for audio input, 2 when the input is MIDI or the chain has an instrument
-/// (an older reader would take either for an audio session). A file is written with the lowest version
-/// that describes it, so audio sessions still open in older versions.
+/// 1 for audio input; 2 when a MIDI source is chosen or the chain has an
+/// instrument (an older reader would take either for an audio session); 3
+/// when an endpoint is None (an older reader would wait for a device by that
+/// name); 4 when an audio device input has a MIDI source or an instrument
+/// beside it (before 4, a MIDI source meant MIDI *instead of* audio, the
+/// device kept beside it was only remembered for switching back, and an
+/// instrument could not have a device input). A file is written with the
+/// lowest version that describes it, so sessions still open in older versions
+/// where they can; see `version(of:)`.
 enum SessionFile {
     static let fileExtension = "plainchain"
     static let applicationId: Int32 = 0x504C_4348  // 'PLCH'
     /// The newest format this app reads and writes.
-    static let formatVersion: Int32 = 2
+    static let formatVersion: Int32 = 4
+
+    /// The lowest format version that describes `session` to an older reader.
+    static func version(of s: Session) -> Int32 {
+        let instrument = s.chain.contains { $0.plugin.isInstrument }
+        if s.input.isDevice, s.input.hasMidi || instrument { return 4 }  // audio and MIDI or an instrument together: older readers would drop the audio, or refuse
+        if (s.input.isNone && !s.input.hasMidi) || s.output.isNone { return 3 }  // None as a device: older readers would wait for it
+        if s.input.hasMidi || instrument { return 2 }
+        return 1
+    }
 
     static func read(_ url: URL) throws -> Session {
         let db = try DB(url, create: false)
@@ -27,7 +42,9 @@ enum SessionFile {
         try db.query("SELECT role, message FROM endpoint") { row in
             endpoints[row.text(0)] = try Capn.decodeEndpoint(row.blob(1))
         }
-        guard let input = endpoints["input"], let output = endpoints["output"] else { throw EngineError("session has no devices") }
+        guard var input = endpoints["input"], let output = endpoints["output"] else { throw EngineError("session has no devices") }
+        // Before version 4 a MIDI source replaced the audio input; the device beside it was not in use.
+        if version < 4, input.hasMidi { input.deviceUid = Endpoint.noneUid; input.channels = [] }
         var chain: [ChainItem] = []
         try db.query("SELECT message FROM chain ORDER BY position") { row in
             chain.append(try Capn.decodeChainItem(row.blob(0)))
@@ -58,8 +75,7 @@ enum SessionFile {
         try db.exec("BEGIN IMMEDIATE")
         do {
             try db.exec("PRAGMA application_id = \(applicationId)")
-            let needsMidi = session.input.isMidi || session.chain.contains { $0.plugin.isInstrument }
-            try db.exec("PRAGMA user_version = \(needsMidi ? formatVersion : 1)")
+            try db.exec("PRAGMA user_version = \(version(of: session))")
             try db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             try db.exec("CREATE TABLE endpoint (role TEXT PRIMARY KEY, message BLOB NOT NULL)")
             try db.exec("CREATE TABLE chain (position INTEGER PRIMARY KEY, message BLOB NOT NULL)")
