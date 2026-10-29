@@ -6,7 +6,8 @@ import Foundation
 
 /// `Plainchain --smoke [PC_IN=name] [PC_OUT=name] [plugin names...]`
 /// Headless check: lists devices and plugins, builds the chain, runs it for
-/// two seconds, round-trips a session file, runs the chain to None output
+/// two seconds, round-trips a session file and checks the records (see
+/// `records`), runs the chain to None output
 /// (see `none`), and runs it with a MIDI source beside the device input (see
 /// `both`). Exits nonzero on failure.
 /// With `PC_MIDI=1` it checks MIDI input instead (see `midi`).
@@ -107,6 +108,7 @@ enum Smoke {
         try SessionFile.write(saved, to: url)
         let back = try SessionFile.read(url)
         print("round trip:", back == saved ? "ok" : "MISMATCH", "state bytes:", back.chain.map { $0.state?.count ?? 0 }, "file:", url.path)
+        try records()
         // The state loads into a fresh instance and reads back the same, without counting as a change.
         for (i, item) in back.chain.enumerated() {
             guard let data = item.state else { continue }
@@ -139,6 +141,43 @@ enum Smoke {
         })
         print("stopped cleanly")
         if env["PC_LISTEN"] != nil { try listen(out) }
+    }
+
+    /// `Plainchain --records-test`: `records` alone, which opens no device, so
+    /// it runs on the host. Exits nonzero on failure.
+    static func runRecords() {
+        do { try records() } catch { print("FAIL: \(error.localizedDescription)"); exit(1) }
+        exit(0)
+    }
+
+    /// The session records, with no device and no plugin instance: a chain
+    /// item naming a CLAP plugin by id and path round-trips at format version
+    /// 5, and a file newer than `SessionFile.formatVersion` is refused, as a
+    /// version 5 file is by a reader whose `formatVersion` is 4.
+    static func records() throws {
+        let clap = PluginId(type: "aumu", subtype: "test", manufacturer: "test",
+                            clapId: "studio.whatissoftware.nfp5", clapPath: "/Library/Audio/Plug-Ins/CLAP/nfp5.clap")
+        let session = Session(input: .none, output: .none, chain: [ChainItem(plugin: clap, inputGainDb: -3)])
+        let dir = FileManager.default.temporaryDirectory
+        let url = dir.appendingPathComponent("smoke-clap.plainchain")
+        try SessionFile.write(session, to: url)
+        let back = try SessionFile.read(url)
+        let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
+        print("CLAP session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version,
+              "clap id:", back.chain.first?.plugin.clapId ?? "", "path:", back.chain.first?.plugin.clapPath ?? "")
+        guard back == session, version == 5 else { throw EngineError("CLAP session did not round-trip at version 5") }
+        // A reader refuses a file newer than its formatVersion: a copy one past this app's version stands for a version 5 file under a version 4 reader.
+        let newer = dir.appendingPathComponent("smoke-clap-newer.plainchain")
+        try? FileManager.default.removeItem(at: newer)
+        try FileManager.default.copyItem(at: url, to: newer)
+        defer { try? FileManager.default.removeItem(at: newer) }
+        try DB(newer, create: false).exec("PRAGMA user_version = \(SessionFile.formatVersion + 1)")
+        do {
+            _ = try SessionFile.read(newer)
+            throw EngineError("a session at format \(SessionFile.formatVersion + 1) was read by a format \(SessionFile.formatVersion) reader")
+        } catch let e as EngineError where e.message.contains("newer than this app understands") {
+            print("  at format \(SessionFile.formatVersion + 1) under format \(SessionFile.formatVersion): refused (\(e.message))")
+        }
     }
 
     /// Audio and MIDI together: a device input with a MIDI source builds and

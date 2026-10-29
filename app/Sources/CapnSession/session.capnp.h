@@ -49,7 +49,7 @@ struct ChainItem {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(910b7ce712a904ba, 1, 5)
+    CAPNP_DECLARE_STRUCT_HEADER(910b7ce712a904ba, 1, 7)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -221,6 +221,12 @@ public:
 
   inline float getInputGainDb() const;
 
+  inline bool hasClapId() const;
+  inline  ::capnp::Text::Reader getClapId() const;
+
+  inline bool hasClapPath() const;
+  inline  ::capnp::Text::Reader getClapPath() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -289,6 +295,20 @@ public:
 
   inline float getInputGainDb();
   inline void setInputGainDb(float value);
+
+  inline bool hasClapId();
+  inline  ::capnp::Text::Builder getClapId();
+  inline void setClapId( ::capnp::Text::Reader value);
+  inline  ::capnp::Text::Builder initClapId(unsigned int size);
+  inline void adoptClapId(::capnp::Orphan< ::capnp::Text>&& value);
+  inline ::capnp::Orphan< ::capnp::Text> disownClapId();
+
+  inline bool hasClapPath();
+  inline  ::capnp::Text::Builder getClapPath();
+  inline void setClapPath( ::capnp::Text::Reader value);
+  inline  ::capnp::Text::Builder initClapPath(unsigned int size);
+  inline void adoptClapPath(::capnp::Orphan< ::capnp::Text>&& value);
+  inline ::capnp::Orphan< ::capnp::Text> disownClapPath();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -730,6 +750,74 @@ inline float ChainItem::Builder::getInputGainDb() {
 inline void ChainItem::Builder::setInputGainDb(float value) {
   _builder.setDataField<float>(
       ::capnp::bounded<1>() * ::capnp::ELEMENTS, value);
+}
+
+inline bool ChainItem::Reader::hasClapId() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
+}
+inline bool ChainItem::Builder::hasClapId() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::Text::Reader ChainItem::Reader::getClapId() const {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::get(_reader.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+inline  ::capnp::Text::Builder ChainItem::Builder::getClapId() {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::get(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+inline void ChainItem::Builder::setClapId( ::capnp::Text::Reader value) {
+  ::capnp::_::PointerHelpers< ::capnp::Text>::set(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::Text::Builder ChainItem::Builder::initClapId(unsigned int size) {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::init(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), size);
+}
+inline void ChainItem::Builder::adoptClapId(
+    ::capnp::Orphan< ::capnp::Text>&& value) {
+  ::capnp::_::PointerHelpers< ::capnp::Text>::adopt(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::Text> ChainItem::Builder::disownClapId() {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::disown(_builder.getPointerField(
+      ::capnp::bounded<5>() * ::capnp::POINTERS));
+}
+
+inline bool ChainItem::Reader::hasClapPath() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS).isNull();
+}
+inline bool ChainItem::Builder::hasClapPath() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::Text::Reader ChainItem::Reader::getClapPath() const {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::get(_reader.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS));
+}
+inline  ::capnp::Text::Builder ChainItem::Builder::getClapPath() {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::get(_builder.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS));
+}
+inline void ChainItem::Builder::setClapPath( ::capnp::Text::Reader value) {
+  ::capnp::_::PointerHelpers< ::capnp::Text>::set(_builder.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::Text::Builder ChainItem::Builder::initClapPath(unsigned int size) {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::init(_builder.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS), size);
+}
+inline void ChainItem::Builder::adoptClapPath(
+    ::capnp::Orphan< ::capnp::Text>&& value) {
+  ::capnp::_::PointerHelpers< ::capnp::Text>::adopt(_builder.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::Text> ChainItem::Builder::disownClapPath() {
+  return ::capnp::_::PointerHelpers< ::capnp::Text>::disown(_builder.getPointerField(
+      ::capnp::bounded<6>() * ::capnp::POINTERS));
 }
 
 inline  ::uint32_t Settings::Reader::getBufferFrames() const {

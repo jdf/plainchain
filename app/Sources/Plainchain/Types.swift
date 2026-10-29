@@ -18,13 +18,21 @@ enum FourCC {
 }
 
 /// Identifies an Audio Unit by component description; stored as text so session files stay readable.
+/// A CLAP plugin is registered as an in-process Audio Unit under a component
+/// description the registry derives from its CLAP id, and carries its CLAP
+/// identity beside that description.
 struct PluginId: Hashable {
     var type: String
     var subtype: String
     var manufacturer: String
+    /// A CLAP plugin's id string, such as "studio.whatissoftware.nfp5"; empty for an Audio Unit.
+    var clapId = ""
+    /// The `.clap` bundle path the CLAP plugin was registered from; empty for an Audio Unit.
+    var clapPath = ""
 
-    init(type: String, subtype: String, manufacturer: String) {
+    init(type: String, subtype: String, manufacturer: String, clapId: String = "", clapPath: String = "") {
         self.type = type; self.subtype = subtype; self.manufacturer = manufacturer
+        self.clapId = clapId; self.clapPath = clapPath
     }
 
     init(_ d: AudioComponentDescription) {
@@ -33,6 +41,8 @@ struct PluginId: Hashable {
         manufacturer = FourCC.string(d.componentManufacturer)
     }
 
+    /// A CLAP plugin, hosted through the in-process Audio Unit registered for it.
+    var isClap: Bool { !clapId.isEmpty }
     /// A music device (`aumu`): a chain head that turns MIDI into audio.
     var isInstrument: Bool { type == "aumu" }
     /// Instruments and music effects (`aumf`) are sent the session's MIDI input.

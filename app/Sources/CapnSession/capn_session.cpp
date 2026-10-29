@@ -58,6 +58,7 @@ template <> void Reader<Settings>::validate() { root.getBufferFrames(); }
 
 template <> void Reader<ChainItem>::validate() {
     root.getId(); root.getType(); root.getSubtype(); root.getManufacturer(); root.getState();
+    root.getClapId(); root.getClapPath();
 }
 
 }  // namespace
@@ -92,7 +93,8 @@ const char *pc_endpoint_midi_source_name(const pc_endpoint *e) { return e->root.
 void pc_endpoint_free(pc_endpoint *e) { delete e; }
 
 pc_buf pc_chain_item_encode(const char *id, const char *type, const char *subtype, const char *manufacturer,
-                            bool bypass, const uint8_t *state, size_t state_len, float input_gain_db) {
+                            bool bypass, const uint8_t *state, size_t state_len, float input_gain_db,
+                            const char *clap_id, const char *clap_path) {
     capnp::MallocMessageBuilder message;
     ChainItem::Builder c = message.initRoot<ChainItem>();
     c.setId(id ? id : "");
@@ -102,6 +104,8 @@ pc_buf pc_chain_item_encode(const char *id, const char *type, const char *subtyp
     c.setBypass(bypass);
     c.setInputGainDb(input_gain_db);
     if (state && state_len > 0) c.setState(kj::ArrayPtr<const kj::byte>(state, state_len));
+    c.setClapId(clap_id ? clap_id : "");
+    c.setClapPath(clap_path ? clap_path : "");
     return toBuf(message);
 }
 
@@ -118,6 +122,8 @@ pc_bytes pc_chain_item_state(const pc_chain_item *c) {
     auto d = c->root.getState();
     return pc_bytes{d.begin(), d.size()};
 }
+const char *pc_chain_item_clap_id(const pc_chain_item *c) { return c->root.getClapId().cStr(); }
+const char *pc_chain_item_clap_path(const pc_chain_item *c) { return c->root.getClapPath().cStr(); }
 void pc_chain_item_free(pc_chain_item *c) { delete c; }
 
 pc_buf pc_settings_encode(uint32_t buffer_frames) {

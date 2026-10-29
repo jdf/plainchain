@@ -18,6 +18,10 @@ struct ChainItem {
   bypass       @4 :Bool;
   state        @5 :Data;        # AUAudioUnit.fullState as a binary plist; empty if none
   inputGainDb  @6 :Float32;     # trim applied before the plugin, in dB (0 = unity)
+  clapId       @7 :Text;        # a CLAP plugin's id string, such as "studio.whatissoftware.nfp5";
+                                # empty for an Audio Unit
+  clapPath     @8 :Text;        # the .clap bundle path the CLAP plugin was registered from;
+                                # empty for an Audio Unit
 }
 
 struct Settings {

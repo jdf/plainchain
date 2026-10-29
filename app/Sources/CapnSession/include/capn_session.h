@@ -35,7 +35,8 @@ void pc_endpoint_free(pc_endpoint *e);
 
 /* ---- ChainItem ---- */
 pc_buf pc_chain_item_encode(const char *id, const char *type, const char *subtype, const char *manufacturer,
-                            bool bypass, const uint8_t *state, size_t state_len, float input_gain_db);
+                            bool bypass, const uint8_t *state, size_t state_len, float input_gain_db,
+                            const char *clap_id, const char *clap_path);
 
 typedef struct pc_chain_item pc_chain_item;
 pc_chain_item *pc_chain_item_read(const uint8_t *bytes, size_t len);   /* NULL if malformed */
@@ -46,6 +47,8 @@ const char *pc_chain_item_manufacturer(const pc_chain_item *c);
 bool pc_chain_item_bypass(const pc_chain_item *c);
 float pc_chain_item_input_gain_db(const pc_chain_item *c);
 pc_bytes pc_chain_item_state(const pc_chain_item *c);
+const char *pc_chain_item_clap_id(const pc_chain_item *c);       /* "" for an Audio Unit and in older files */
+const char *pc_chain_item_clap_path(const pc_chain_item *c);     /* "" for an Audio Unit and in older files */
 void pc_chain_item_free(pc_chain_item *c);
 
 /* ---- Settings ---- */

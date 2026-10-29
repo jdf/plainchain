@@ -15,17 +15,20 @@ import SQLite3
 /// name); 4 when an audio device input has a MIDI source or an instrument
 /// beside it (before 4, a MIDI source meant MIDI *instead of* audio, the
 /// device kept beside it was only remembered for switching back, and an
-/// instrument could not have a device input). A file is written with the
+/// instrument could not have a device input); 5 when the chain holds a CLAP
+/// plugin (an older reader would find no Audio Unit under its component
+/// description and report it as not installed). A file is written with the
 /// lowest version that describes it, so sessions still open in older versions
 /// where they can; see `version(of:)`.
 enum SessionFile {
     static let fileExtension = "plainchain"
     static let applicationId: Int32 = 0x504C_4348  // 'PLCH'
     /// The newest format this app reads and writes.
-    static let formatVersion: Int32 = 4
+    static let formatVersion: Int32 = 5
 
     /// The lowest format version that describes `session` to an older reader.
     static func version(of s: Session) -> Int32 {
+        if s.chain.contains(where: { $0.plugin.isClap }) { return 5 }  // a CLAP plugin: older readers would find no Audio Unit for it
         let instrument = s.chain.contains { $0.plugin.isInstrument }
         if s.input.isDevice, s.input.hasMidi || instrument { return 4 }  // audio and MIDI or an instrument together: older readers would drop the audio, or refuse
         if (s.input.isNone && !s.input.hasMidi) || s.output.isNone { return 3 }  // None as a device: older readers would wait for it

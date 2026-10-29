@@ -101,13 +101,13 @@ None output writes nothing to a device. The output stage renders into a private 
 
 ## Session file format
 
-A `.plainchain` file is a SQLite database (`PRAGMA application_id` = `PLCH`, `user_version` = format version: 1; 2 when a MIDI source is chosen or the chain has an instrument; 3 when an endpoint is None, which an older version would otherwise wait for as a device; 4 when an audio device input has a MIDI source or an instrument beside it, which an older version would take as MIDI alone, or refuse; a file gets the lowest version that describes it, so sessions still open in older versions where they can):
+A `.plainchain` file is a SQLite database (`PRAGMA application_id` = `PLCH`, `user_version` = format version: 1; 2 when a MIDI source is chosen or the chain has an instrument; 3 when an endpoint is None, which an older version would otherwise wait for as a device; 4 when an audio device input has a MIDI source or an instrument beside it, which an older version would take as MIDI alone, or refuse; 5 when the chain holds a CLAP plugin, which an older version could not load; a file gets the lowest version that describes it, so sessions still open in older versions where they can):
 
 | Table | Columns | Row |
 |---|---|---|
 | `meta` | `key`, `value` | `saved` timestamp, `app` |
 | `endpoint` | `role`, `message` | one `Endpoint` message for `input` and one for `output`; the input's `midiSource` is its MIDI source (a source's unique ID, `*` for all, or empty for none) with `midiSourceName`, beside its audio device and channels; None is the device UID `com.plainchain.none` with no channels. Before version 4 a non-empty `midiSource` meant MIDI instead of audio, so a reader takes such a file's audio input as None |
-| `chain` | `position`, `message` | one `ChainItem` message per slot, in chain order |
+| `chain` | `position`, `message` | one `ChainItem` message per slot, in chain order; a CLAP plugin's item holds its CLAP id in `clapId` and the bundle path it was registered from in `clapPath`, beside the component description registered for it; both are empty for an Audio Unit |
 
 Messages are flat (unpacked) Cap'n Proto, per `schema/session.capnp`, so the `capnp` CLI can decode them straight out of the database:
 

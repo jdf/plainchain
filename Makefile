@@ -11,7 +11,7 @@ ICONSRC := app/Assets/icon-1024.png
 SIGN    := $(if $(DEVELOPER_ID_APPLICATION),"$(DEVELOPER_ID_APPLICATION)",-)
 PROFILE ?= plainchain
 
-.PHONY: all app bundle run install smoke hotplug-test midi-test clap-test clean icon notarize dist
+.PHONY: all app bundle run install smoke records-test hotplug-test midi-test clap-test clean icon notarize dist
 
 all: bundle
 
@@ -68,6 +68,11 @@ dist: notarize
 # PC_INSTRUMENT names an instrument with an input bus (a vocoder) to run on the device input.
 smoke: bundle
 	"$(BUNDLE)/Contents/MacOS/$(APP)" --smoke $(PLUGINS)
+
+# The session records alone, which opens no device and runs on the host: a chain
+# item naming a CLAP plugin round-trips at format version 5, and a newer file is refused.
+records-test: bundle
+	"$(BUNDLE)/Contents/MacOS/$(APP)" --records-test
 
 # Device hot-plug recovery, in the Tart test VM (never on the host): a fake
 # interface (a public aggregate under a fixed UID) is unplugged and replugged

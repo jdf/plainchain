@@ -1,7 +1,8 @@
 import AVFoundation
 import Foundation
 
-/// An installed Audio Unit effect or instrument.
+/// An installed Audio Unit effect or instrument. A CLAP plugin's `id` carries
+/// its CLAP identity (`PluginId.clapId` and `clapPath`).
 struct Plugin: Identifiable, Hashable {
     let id: PluginId
     let name: String

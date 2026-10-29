@@ -26,7 +26,8 @@ enum Capn {
         let state = c.state ?? Data()
         let buf = state.withUnsafeBytes { s in
             pc_chain_item_encode(c.id.uuidString, c.plugin.type, c.plugin.subtype, c.plugin.manufacturer, c.bypass,
-                                 s.baseAddress?.assumingMemoryBound(to: UInt8.self), s.count, c.inputGainDb)
+                                 s.baseAddress?.assumingMemoryBound(to: UInt8.self), s.count, c.inputGainDb,
+                                 c.plugin.clapId, c.plugin.clapPath)
         }
         defer { pc_buf_free(buf) }
         return Data(bytes: buf.bytes, count: buf.len)
@@ -43,7 +44,9 @@ enum Capn {
             plugin: PluginId(
                 type: String(cString: pc_chain_item_type(r)),
                 subtype: String(cString: pc_chain_item_subtype(r)),
-                manufacturer: String(cString: pc_chain_item_manufacturer(r))
+                manufacturer: String(cString: pc_chain_item_manufacturer(r)),
+                clapId: String(cString: pc_chain_item_clap_id(r)),
+                clapPath: String(cString: pc_chain_item_clap_path(r))
             ),
             bypass: pc_chain_item_bypass(r),
             inputGainDb: pc_chain_item_input_gain_db(r),
