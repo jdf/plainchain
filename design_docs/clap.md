@@ -326,3 +326,8 @@ both pass.
     latency): pulling the input bus, bypass,
     `clap.configurable-audio-ports`, a latency change, and a parameter
     rescan.
+- 2026-10-29: K2 done in `f26af4aae1a8`: `ChainItem` carries `clapId` and
+  `clapPath`, `PluginId` holds them, and a chain with a CLAP plugin is
+  written at format version 5. `Plainchain --records-test` (`make
+  records-test`, also run by the smoke) round-trips such a session at
+  version 5 and shows a newer file refused, with no device opened.
