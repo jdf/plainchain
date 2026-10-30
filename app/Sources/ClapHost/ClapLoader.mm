@@ -44,6 +44,10 @@ constexpr uint64_t kFnvPrime = 0x100000001b3ULL;
 /// Printable ASCII without the space: '!' (0x21) through '~' (0x7e).
 constexpr uint32_t kPrintableFirst = 0x21;
 constexpr uint32_t kPrintableCount = 0x7e - 0x21 + 1;
+/// The first two characters of a code that FourCC reads as hexadecimal, and
+/// the character that replaces the '0' in such a code.
+constexpr uint32_t kHexPrefix = '0' << 8 | 'x';
+constexpr uint32_t kHexPrefixReplacement = '1';
 
 std::map<std::string, Bundle> &Bundles() {
     static auto *bundles = new std::map<std::string, Bundle>;
@@ -170,13 +174,30 @@ uint64_t Fnv1a(const char *text) {
 
 /// Each byte of `bits` becomes one of the 94 printable characters other than
 /// the space, so Plainchain's four-character text form of the code (FourCC)
-/// stays readable in session files.
-uint32_t Printable(uint32_t bits) {
+/// stays readable in session files. That text form reads a code beginning
+/// "0x" as a hexadecimal number, so a code whose first two characters would
+/// be "0x" begins "1x" instead; every other code is the bytes mapped as they
+/// are. Sets `moved` when the code was moved off "0x".
+uint32_t Printable(uint32_t bits, bool &moved) {
     uint32_t code = 0;
     for (int shift = 24; shift >= 0; shift -= 8) {
         code |= (kPrintableFirst + ((bits >> shift) & 0xff) % kPrintableCount) << shift;
     }
+    if ((code >> 16) == kHexPrefix) {
+        code = (code & 0x00ffffff) | (kHexPrefixReplacement << 24);
+        moved = true;
+    }
     return code;
+}
+
+/// A CLAP id's subtype and manufacturer codes: the two halves of its 64-bit
+/// FNV-1a hash, each made printable. Returns whether either was moved off "0x".
+bool ComponentCodes(const char *clap_id, uint32_t *subtype, uint32_t *manufacturer) {
+    uint64_t hash = Fnv1a(clap_id);
+    bool moved = false;
+    *subtype = Printable(static_cast<uint32_t>(hash >> 32), moved);
+    *manufacturer = Printable(static_cast<uint32_t>(hash), moved);
+    return moved;
 }
 
 /// The Audio Unit version for a CLAP version string such as "1.4.4":
@@ -248,10 +269,9 @@ int pc_clap_register_bundle(const char *path) {
     for (uint32_t i = 0; i < count; i++) {
         const clap_plugin_descriptor_t *d = bundle->factory->get_plugin_descriptor(bundle->factory, i);
         if (!d || !d->id) continue;
-        // Subtype and manufacturer are the two halves of the id's 64-bit FNV-1a hash.
-        uint64_t hash = Fnv1a(d->id);
-        uint32_t subtype = Printable(static_cast<uint32_t>(hash >> 32));
-        uint32_t manufacturer = Printable(static_cast<uint32_t>(hash));
+        uint32_t subtype = 0;
+        uint32_t manufacturer = 0;
+        ComponentCodes(d->id, &subtype, &manufacturer);
         bool known = false;
         for (uint32_t type : {kFourCcMusicDevice, kFourCcMusicEffect, kFourCcEffect}) {
             known = known || IsRegistered(type, subtype, manufacturer);
@@ -275,6 +295,10 @@ int pc_clap_register_bundle(const char *path) {
 }
 
 int pc_clap_scan(const char *directory) { return ScanDirectory(@(directory)); }
+
+bool pc_clap_component_codes(const char *clap_id, uint32_t *subtype, uint32_t *manufacturer) {
+    return ComponentCodes(clap_id, subtype, manufacturer);
+}
 
 bool pc_clap_shutdown(void) {
     if (g_live_plugins != 0) {

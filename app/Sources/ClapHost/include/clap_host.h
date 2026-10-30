@@ -36,6 +36,11 @@ typedef struct pc_clap_plugin {
    Nothing deinitializes the entries at exit on its own, when a bundle's static storage may already be gone. */
 bool pc_clap_shutdown(void);
 
+/* The subtype and manufacturer a plugin with this CLAP id is registered under: the two halves of the id's
+   64-bit FNV-1a hash, each byte one of the printable characters other than the space, and never beginning
+   "0x". Returns whether either code was moved off a leading "0x". */
+bool pc_clap_component_codes(const char *clap_id, uint32_t *subtype, uint32_t *manufacturer);
+
 int pc_clap_count(void);
 bool pc_clap_plugin_at(int index, pc_clap_plugin *out);
 /* The registered plugin with this component description. */

@@ -76,6 +76,7 @@ enum ClapTest {
         try expect(pc_clap_lookup(plugin.type, plugin.subtype, plugin.manufacturer, &found)
                    && String(cString: found.clap_id) == String(cString: plugin.clap_id), "the lookup by description does not find the plugin")
         print("lookup by description: \(String(cString: found.clap_id)) in \(String(cString: found.path))")
+        try checkCodes(plugin)
 
         var desc = AudioComponentDescription(componentType: plugin.type, componentSubType: plugin.subtype,
                                              componentManufacturer: plugin.manufacturer, componentFlags: 0, componentFlagsMask: 0)
@@ -263,6 +264,41 @@ enum ClapTest {
         print("uninitialized: plugin \(info.active ? "STILL ACTIVE" : "deactivated"); dropped events \(info.dropped_events)")
         try expect(!info.active, "the plugin is still active after AudioUnitUninitialize")
         try expect(info.dropped_events == 0, "\(info.dropped_events) events were dropped")
+    }
+
+    /// Synthetic CLAP ids whose component codes the check derives; among them
+    /// are ids whose hash maps to a code beginning "0x".
+    static let syntheticIds = 4096
+    static let syntheticIdFormat = "studio.plainchain.synthetic-%d"
+
+    /// The component codes the registry derives from a CLAP id: the plugin's
+    /// own as registered, and for `syntheticIds` made-up ids, none beginning
+    /// "0x" (which FourCC reads as hexadecimal), none holding a byte outside
+    /// '!' through '~', and each the same after FourCC's text and back.
+    private static func checkCodes(_ plugin: pc_clap_plugin) throws {
+        var subtype: UInt32 = 0, manufacturer: UInt32 = 0
+        pc_clap_component_codes(plugin.clap_id, &subtype, &manufacturer)
+        print("component codes of \(String(cString: plugin.clap_id)): \(FourCC.string(subtype)) \(FourCC.string(manufacturer))")
+        try expect(subtype == plugin.subtype && manufacturer == plugin.manufacturer, "the registered codes are not the ones derived from the CLAP id")
+        var moved = 0
+        var hex: [String] = []
+        var unprintable: [String] = []
+        var unreadable: [String] = []
+        for i in 0..<syntheticIds {
+            let id = String(format: syntheticIdFormat, i)
+            if pc_clap_component_codes(id, &subtype, &manufacturer) { moved += 1 }
+            for code in [subtype, manufacturer] {
+                let bytes = withUnsafeBytes(of: code.bigEndian) { Array($0) }
+                if bytes[0] == UInt8(ascii: "0") && bytes[1] == UInt8(ascii: "x") { hex.append(id) }
+                if !bytes.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) { unprintable.append(id) }
+                if FourCC.code(FourCC.string(code)) != code { unreadable.append(id) }
+            }
+        }
+        print("component codes of \(syntheticIds) synthetic ids: \(moved) moved off \"0x\", \(hex.count) beginning \"0x\", \(unprintable.count) with a byte outside '!'...'~', \(unreadable.count) changed by FourCC's text and back")
+        try expect(moved > 0, "no synthetic id's code would have begun \"0x\"; the check exercises nothing")
+        try expect(hex.isEmpty, "codes beginning \"0x\": \(hex.prefix(5))")
+        try expect(unprintable.isEmpty, "codes with a byte outside '!'...'~': \(unprintable.prefix(5))")
+        try expect(unreadable.isEmpty, "codes changed by FourCC's text and back: \(unreadable.prefix(5))")
     }
 
     /// Middle C on or off through `MusicDeviceMIDIEvent`, then a second of
