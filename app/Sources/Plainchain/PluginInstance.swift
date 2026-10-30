@@ -10,10 +10,14 @@ import Foundation
 /// and similar plugins take the thread that instantiates them as their
 /// message thread, and their editors (shown on the main thread) misbehave if
 /// that was some other thread. Version 3 components run out of process, so
-/// they keep the asynchronous `AVAudioUnit` path.
+/// they keep the asynchronous `AVAudioUnit` path. A CLAP plugin is a
+/// version 3 component registered in this process (`ClapHost`), and takes
+/// that path too.
 ///
 /// Main-thread only: creation, state, observation, and disposal.
 final class PluginInstance {
+    /// The plugin as created; for a CLAP plugin, as the registry holds it, with
+    /// the component description registered for it and the bundle it was loaded from.
     let id: PluginId
     /// The raw handle the engine wires; for v3, the bridge `AVAudioUnit` offers.
     let audioUnit: AudioUnit
@@ -49,10 +53,19 @@ final class PluginInstance {
         if avUnit == nil { AudioComponentInstanceDispose(audioUnit) }
     }
 
-    /// Load a plugin: v2 synchronously here on the main thread, v3 through AVFoundation.
+    /// Load a plugin: v2 synchronously here on the main thread, v3 through
+    /// AVFoundation. A CLAP plugin is registered from its bundle path first
+    /// when the registry lacks it, and is "not installed" when the bundle is gone.
     @MainActor
     static func make(_ id: PluginId) async throws -> PluginInstance {
+        if id.isClap { return try await makeV3(Plugins.registerClap(id)) }
         if let v2 = try makeV2(id) { return v2 }
+        return try await makeV3(id)
+    }
+
+    /// A v3 component, through `AVAudioUnit.instantiate`.
+    @MainActor
+    private static func makeV3(_ id: PluginId) async throws -> PluginInstance {
         let (av, onMain): (AVAudioUnit, Bool) = try await withCheckedThrowingContinuation { cont in
             AVAudioUnit.instantiate(with: id.description, options: []) { unit, error in
                 if let unit { cont.resume(returning: (unit, Thread.isMainThread)) } else { cont.resume(throwing: error ?? EngineError("could not load plugin")) }

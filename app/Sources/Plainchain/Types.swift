@@ -43,6 +43,13 @@ struct PluginId: Hashable {
 
     /// A CLAP plugin, hosted through the in-process Audio Unit registered for it.
     var isClap: Bool { !clapId.isEmpty }
+    /// What to call the plugin when it is not installed: a CLAP plugin's
+    /// bundle name (its CLAP id without a path), an Audio Unit's manufacturer
+    /// and subtype codes.
+    var fallbackName: String {
+        guard isClap else { return "\(manufacturer) \(subtype)" }
+        return clapPath.isEmpty ? clapId : URL(fileURLWithPath: clapPath).deletingPathExtension().lastPathComponent
+    }
     /// A music device (`aumu`): a chain head that turns MIDI into audio.
     var isInstrument: Bool { type == "aumu" }
     /// Instruments and music effects (`aumf`) are sent the session's MIDI input.

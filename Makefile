@@ -11,7 +11,7 @@ ICONSRC := app/Assets/icon-1024.png
 SIGN    := $(if $(DEVELOPER_ID_APPLICATION),"$(DEVELOPER_ID_APPLICATION)",-)
 PROFILE ?= plainchain
 
-.PHONY: all app bundle run install smoke records-test hotplug-test midi-test clap-test clean icon notarize dist
+.PHONY: all app bundle run install smoke records-test hotplug-test midi-test clap-test clap-vm-test clean icon notarize dist
 
 all: bundle
 
@@ -70,7 +70,8 @@ smoke: bundle
 	"$(BUNDLE)/Contents/MacOS/$(APP)" --smoke $(PLUGINS)
 
 # The session records alone, which opens no device and runs on the host: a chain
-# item naming a CLAP plugin round-trips at format version 5, and a newer file is refused.
+# item naming a CLAP plugin round-trips at format version 5, a newer file is refused,
+# and such an item reopens as a plugin (nfp5, when it is installed), or as not installed.
 records-test: bundle
 	"$(BUNDLE)/Contents/MacOS/$(APP)" --records-test
 
@@ -83,7 +84,8 @@ hotplug-test: bundle
 
 # MIDI input, in the Tart test VM: a virtual MIDI source plays Apple's DLS synth
 # into BlackHole, by source, through "all sources", and through the
-# app's virtual destination (Plainchain --smoke with PC_MIDI=1).
+# app's virtual destination (Plainchain --smoke with PC_MIDI=1); and nfp5 in its
+# place, when clap-vm-test has put nfp5 in the guest.
 midi-test: bundle
 	tools/testvm.sh midi
 
@@ -92,6 +94,12 @@ midi-test: bundle
 CLAP ?= $(HOME)/Library/Audio/Plug-Ins/CLAP/nfp5.clap
 clap-test: bundle
 	"$(BUNDLE)/Contents/MacOS/$(APP)" --clap-test "$(CLAP)"
+
+# A CLAP plugin in the chain, in the Tart test VM: the app and
+# ~/Library/Audio/Plug-Ins/CLAP/nfp5.clap are copied in, and the smoke runs
+# with nfp5 as the instrument on BlackHole (Plainchain --smoke nfp5).
+clap-vm-test: bundle
+	tools/testvm.sh clap
 
 clean:
 	rm -rf app/.build "$(BUILD)"

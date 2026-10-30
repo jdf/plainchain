@@ -341,8 +341,11 @@ struct ChainRow<Handle: Gesture>: View {
             }
             VStack(alignment: .leading) {
                 Text(model.name(of: item.plugin))
-                Text(model.plugin(item.plugin)?.manufacturer ?? item.plugin.manufacturer)
-                    .font(.caption).foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text(model.plugin(item.plugin)?.manufacturer ?? item.plugin.manufacturer)
+                        .font(.caption).foregroundStyle(.secondary)
+                    if item.plugin.isClap { ClapTag() }
+                }
             }
             .opacity(item.bypass ? 0.5 : 1)
             Spacer(minLength: 8)
@@ -546,7 +549,19 @@ struct ReductionView: View {
     }
 }
 
-/// Searchable list of installed Audio Units, grouped by manufacturer.
+/// Marks a CLAP plugin, beside its name in the picker and its manufacturer in the chain.
+struct ClapTag: View {
+    var body: some View {
+        Text("CLAP")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 3)
+            .overlay(RoundedRectangle(cornerRadius: 2).strokeBorder(Color(nsColor: .separatorColor)))
+            .help("CLAP plugin")
+    }
+}
+
+/// Searchable list of installed Audio Units and CLAP plugins, grouped by manufacturer.
 struct PluginPicker: View {
     @EnvironmentObject private var model: Model
     @State private var query = ""
@@ -586,7 +601,7 @@ struct PluginPicker: View {
                     Button(action: rescan) { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
                         .frame(width: 20)
-                        .help("Rescan installed Audio Units")
+                        .help("Rescan installed Audio Units and CLAP plugins")
                 }
             }
             .padding(8)
@@ -594,7 +609,12 @@ struct PluginPicker: View {
                 ForEach(grouped, id: \.0) { manufacturer, plugins in
                     Section(manufacturer) {
                         ForEach(plugins) { p in
-                            Button(p.name) { choose(p) }
+                            Button { choose(p) } label: {
+                                HStack(spacing: 5) {
+                                    Text(p.name)
+                                    if p.id.isClap { ClapTag() }
+                                }
+                            }
                                 .buttonStyle(.plain)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .contentShape(Rectangle())

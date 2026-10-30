@@ -28,7 +28,15 @@ enum ClapTest {
     static let observerWait: TimeInterval = 1
 
     static func run() {
-        do { try go() } catch { print("FAIL: \(error.localizedDescription)"); exit(1) }
+        do {
+            // The instances are gone when the pool drains, before the bundles are deinitialized.
+            try autoreleasepool { try go() }
+        } catch {
+            print("FAIL: \(error.localizedDescription)")
+            print(Plugins.shutdownClap())
+            exit(1)
+        }
+        print(Plugins.shutdownClap())
         print("PASS")
         exit(0)
     }

@@ -63,6 +63,7 @@ final class AppState: ObservableObject {
             devices = d
             for x in d { deviceNames[x.uid] = x.name }
         }
+        Plugins.registerClap()
         plugins = Plugins.installed()
         midiSources = midi.sources
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
@@ -100,8 +101,10 @@ final class AppState: ObservableObject {
         for m in liveModels { m.devicesChanged() }
     }
 
-    /// Re-read the installed Audio Units from the system registry.
+    /// Re-read the installed Audio Units from the system registry, and rescan
+    /// the CLAP directories for plugins installed since the last scan.
     func refreshPlugins() {
+        Plugins.registerClap()
         let p = Plugins.installed()
         if p != plugins { plugins = p }
     }
@@ -197,11 +200,14 @@ final class AppState: ObservableObject {
         return pendingRefs.contains { same($0.path) }
     }
 
-    /// Before quitting: every session is autosaved and stays in the restore list.
+    /// Before quitting: every session is autosaved and stays in the restore
+    /// list, and every plugin is disposed; then the CLAP bundles are
+    /// deinitialized, which must not wait for exit.
     func shutdown() {
         terminating = true
-        for m in liveModels { m.shutdown() }
+        autoreleasepool { for m in liveModels { m.shutdown() } }
         writeOpenSessions()
+        _ = Plugins.shutdownClap()  // logged by ClapHost when a plugin is still alive
     }
 
     // MARK: Restore list

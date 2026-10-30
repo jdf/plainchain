@@ -29,6 +29,8 @@
 #   tools/testvm.sh push                 (build/Plainchain.app -> guest ~/Plainchain.app)
 #   tools/testvm.sh hotplug              (push, then Plainchain --hotplug-test in the Aqua session; exit status passed through)
 #   tools/testvm.sh midi                 (push, then PC_MIDI=1 Plainchain --smoke in the Aqua session; exit status passed through)
+#   tools/testvm.sh clap                 (push, copy ~/Library/Audio/Plug-Ins/CLAP/nfp5.clap to the guest's, then
+#                                         Plainchain --smoke nfp5 on BlackHole in the Aqua session; exit status passed through)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -39,6 +41,8 @@ if [ ! -x "$testvm/testvm.sh" ]; then
 fi
 export TESTVM_NAME="${TESTVM_NAME:-plainchain-tests}"
 bundle=build/Plainchain.app
+# The CLAP instrument the smoke runs, from the host's CLAP directory into the guest's.
+nfp5=$HOME/Library/Audio/Plug-Ins/CLAP/nfp5.clap
 
 push() {
     if [ ! -d "$bundle" ]; then
@@ -79,8 +83,19 @@ midi)
     push
     exec "$testvm/testvm.sh" run --aqua /usr/bin/env PC_MIDI=1 PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --smoke
     ;;
+clap)
+    shift
+    if [ ! -d "$nfp5" ]; then
+        echo "testvm: $nfp5 is missing; build and install nfp5 first" >&2
+        exit 1
+    fi
+    push
+    # The guest's own CLAP directory, which the app scans; the copy mirrors the bundle.
+    "$testvm/testvm.sh" copy "$nfp5" Library/Audio/Plug-Ins/CLAP/nfp5.clap
+    exec "$testvm/testvm.sh" run --aqua /usr/bin/env PC_IN=BlackHole PC_OUT=BlackHole Plainchain.app/Contents/MacOS/Plainchain --smoke nfp5
+    ;;
 *)
-    echo "usage: tools/testvm.sh [status|up|down|ip|ssh|push|hotplug|midi|run [--aqua] <command> [args...]]" >&2
+    echo "usage: tools/testvm.sh [status|up|down|ip|ssh|push|hotplug|midi|clap|run [--aqua] <command> [args...]]" >&2
     exit 2
     ;;
 esac

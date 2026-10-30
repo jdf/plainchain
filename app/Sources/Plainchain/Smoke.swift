@@ -1,20 +1,34 @@
 import AVFoundation
 import CapnSession
+import ClapHost
 import Combine
 import CoreMIDI
 import Foundation
 
 /// `Plainchain --smoke [PC_IN=name] [PC_OUT=name] [plugin names...]`
-/// Headless check: lists devices and plugins, builds the chain, runs it for
-/// two seconds, round-trips a session file and checks the records (see
-/// `records`), runs the chain to None output
+/// Headless check: lists devices and plugins (CLAP plugins registered first),
+/// builds the chain, runs it for two seconds, round-trips a session file and
+/// checks the records (see `records`), runs the chain to None output
 /// (see `none`), and runs it with a MIDI source beside the device input (see
-/// `both`). Exits nonzero on failure.
+/// `both`). A plugin is named by its name, its subtype, or its CLAP id; an
+/// instrument among them heads the chain, and a note pushed into its MIDI
+/// ring must sound. Exits nonzero on failure.
 /// With `PC_MIDI=1` it checks MIDI input instead (see `midi`).
 enum Smoke {
+    /// The CLAP instrument the MIDI smoke plays when it is installed.
+    static let nfp5 = "studio.whatissoftware.nfp5"
+
     static func run() {
-        do { try go() } catch { print("FAIL: \(error.localizedDescription)"); exit(1) }
-        exit(0)
+        finish { try go() }
+    }
+
+    /// Runs a check, then deinitializes the CLAP bundles once its plugins are
+    /// gone (the pool drained), and exits: nonzero when the check failed.
+    private static func finish(_ check: () throws -> Void) -> Never {
+        var failed = false
+        do { try autoreleasepool { try check() } } catch { print("FAIL: \(error.localizedDescription)"); failed = true }
+        print(Plugins.shutdownClap())
+        exit(failed ? 1 : 0)
     }
 
     private static func go() throws {
@@ -24,8 +38,9 @@ enum Smoke {
             print(String(format: "%4d in %2d out %2d @%6.0f %@%@ %@", d.id, d.inputChannels, d.outputChannels, d.sampleRate,
                          d.defaultInput ? "I" : " ", d.defaultOutput ? "O" : " ", d.name))
         }
+        Plugins.registerClap()
         let plugins = Plugins.installed()
-        print("\(plugins.count) plugins")
+        print("\(plugins.count) plugins, \(plugins.filter(\.id.isClap).count) of them CLAP")
         func pick(_ key: String, _ dflt: (Device) -> Bool) throws -> Device {
             if let n = env[key] {
                 guard let d = devices.first(where: { $0.name.contains(n) }) else { throw EngineError("no device \(n)") }
@@ -35,15 +50,18 @@ enum Smoke {
             return d
         }
         let out = try pick("PC_OUT", \.defaultOutput)
-        if env["PC_MIDI"] != nil { try midi(devices, out); return }
+        if env["PC_MIDI"] != nil { try midi(devices, out, clap: plugins.first { $0.id.clapId == nfp5 }); return }
         let inp = try pick("PC_IN", \.defaultInput)
         let names = CommandLine.arguments.drop(while: { $0 != "--smoke" }).dropFirst()
         var units: [PluginInstance] = []
         var chain: [ChainItem] = []
+        /// The plugins' names, in chain order.
+        var labels: [String] = []
         for n in names {
-            guard let p = plugins.first(where: { $0.name == n || $0.id.subtype == n }) else { throw EngineError("no plugin \(n)") }
+            guard let p = plugins.first(where: { $0.name == n || $0.id.subtype == n || $0.id.clapId == n }) else { throw EngineError("no plugin \(n)") }
             let unit = try wait { try await PluginInstance.make(p.id) }
-            print("  \(p.name): \(describe(unit)); \(unit.parameterNames.count) params; gain reduction meter: \(Plugins.gainReductionMeter(unit.audioUnit).map { "param \($0.id)" } ?? "none")")
+            let format = p.id.isClap ? "CLAP \(p.id.clapId) from \(p.id.clapPath) as \(p.id.type)" : p.id.type
+            print("  \(p.name) (\(format)): \(describe(unit)); \(unit.parameterNames.count) params; gain reduction meter: \(Plugins.gainReductionMeter(unit.audioUnit).map { "param \($0.id)" } ?? "none")")
             if env["PC_UI"] != nil {
                 var size: UInt32 = 0
                 var writable: DarwinBoolean = false
@@ -75,7 +93,17 @@ enum Smoke {
             }
             units.append(unit)
             chain.append(ChainItem(plugin: p.id, inputGainDb: -6))
+            labels.append(p.name)
         }
+        // An instrument heads the chain, as the app puts it there; the smoke takes one.
+        let instruments = chain.indices.filter { chain[$0].plugin.isInstrument }
+        guard instruments.count <= 1 else { throw EngineError("the smoke takes one instrument, not \(instruments.count)") }
+        if let i = instruments.first, i != 0 {
+            units.insert(units.remove(at: i), at: 0)
+            chain.insert(chain.remove(at: i), at: 0)
+            labels.insert(labels.remove(at: i), at: 0)
+        }
+        let instrumentHead = !instruments.isEmpty
         // In and out on one device with room to spare: out on 3-4, so a loopback device
         // (BlackHole in the test VM) does not feed the output back into the input.
         let outFirst: UInt32 = inp.uid == out.uid && out.outputChannels >= 4 ? 2 : 0
@@ -85,17 +113,42 @@ enum Smoke {
             chain: chain,
             bufferFrames: Int(env["PC_BUFFER"] ?? "") ?? 0
         )
-        print("session: \(inp.name) \(session.input.channels) -> \(names.joined(separator: " -> ")) -> \(out.name) \(session.output.channels)")
-        let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
-        var engine: Engine! = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, bufferFrames: session.bufferFrames)
+        print("session: \(inp.name) \(session.input.channels) -> \(labels.joined(separator: " -> ")) -> \(out.name) \(session.output.channels)")
+        // An instrument at the head is played by a note pushed straight into its MIDI ring.
+        let fanout = pc_midi_fanout_new()!
+        var engine: Engine! = try Engine(input: session.input, output: session.output, devices: devices, stages: engineStages(units, chain),
+                                         bufferFrames: session.bufferFrames, midi: fanout)
+        if instrumentHead {
+            pc_store_u32(&fanout.pointee.active, UInt32(engine.midiRingCount))
+            pc_midi_fanout_push(fanout, 0x90_3C64)  // note on, channel 1, note 60, velocity 100
+        }
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 2))
         print("status:", engine.status)
-        print("peaks per stage:", (0...units.count).map { engine.takePeaks($0) })
-        if units.count >= 2 {
-            engine.reorder(Array((0..<units.count).reversed()))
+        let peaks = (0...units.count).map { engine.takePeaks($0) }
+        print("peaks per stage:", peaks)
+        if instrumentHead {
+            pc_midi_fanout_push(fanout, 0x80_3C00)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+            pc_store_u32(&fanout.pointee.active, 0)
+            // The device input goes into the instrument's input bus; with none, it is unused.
+            var buses: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            if AudioUnitGetProperty(units[0].audioUnit, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &buses, &size) != noErr { buses = 0 }
+            let peak = peaks[0].max() ?? 0
+            print(String(format: "instrument %@ at the head: %u input buses, audio input unused %@, MIDI rings %d, a note into its ring peaked at %.3f, errors %d",
+                         labels[0], buses, engine.audioInputUnused ? "yes" : "no", engine.midiRingCount, peak, engine.status.renderErrors))
+            guard engine.audioInputUnused == (buses == 0), engine.midiRingCount >= 1, peak > 0.01, engine.status.renderErrors == 0 else {
+                throw EngineError("the instrument \(labels[0]) did not play at the head of the chain")
+            }
+        }
+        // A reorder moves the effects; an instrument stays at the head.
+        let head = instrumentHead ? 1 : 0
+        if units.count - head >= 2 {
+            let order = Array(0..<head) + Array((head..<units.count).reversed())
+            engine.reorder(order)
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
             print("reorder applied:", !engine.swapPending, "errors:", engine.status.renderErrors)
-            engine.reorder(Array((0..<units.count).reversed()))
+            engine.reorder(order)
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
             print("reorder back applied:", !engine.swapPending, "errors:", engine.status.renderErrors)
         }
@@ -121,7 +174,7 @@ enum Smoke {
             // Compared as dictionaries: binary plists of equal dictionaries can order their keys differently.
             func dict(_ d: Data?) -> NSDictionary? { d.flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? NSDictionary } }
             let same = dict(fresh.state).map { $0.isEqual(dict(data)) } ?? false
-            print("  state into a fresh \(names[names.startIndex + i]): reads back \(same ? "the same" : "DIFFERENT"), changes signalled: \(changes)")
+            print("  state into a fresh \(labels[i]): reads back \(same ? "the same" : "DIFFERENT"), changes signalled: \(changes)")
             guard same, changes == 0 else { throw EngineError("plugin state did not round-trip quietly") }
             // A parameter edit through the AU parameter API is signalled.
             if let p = Plugins.v2Parameters(fresh.audioUnit).first(where: { AudioUnitParameterOptions(rawValue: $0.flags).contains(.flag_IsWritable) }) {
@@ -144,16 +197,20 @@ enum Smoke {
     }
 
     /// `Plainchain --records-test`: `records` alone, which opens no device, so
-    /// it runs on the host. Exits nonzero on failure.
+    /// it runs on the host; there, with no scan before it, the CLAP plugin it
+    /// reopens is registered from the chain item's bundle path. Exits nonzero on failure.
     static func runRecords() {
-        do { try records() } catch { print("FAIL: \(error.localizedDescription)"); exit(1) }
-        exit(0)
+        finish { try records() }
     }
 
-    /// The session records, with no device and no plugin instance: a chain
-    /// item naming a CLAP plugin by id and path round-trips at format version
-    /// 5, and a file newer than `SessionFile.formatVersion` is refused, as a
-    /// version 5 file is by a reader whose `formatVersion` is 4.
+    /// The session records, with no device: a chain item naming a CLAP plugin
+    /// by id and path round-trips at format version 5, and a file newer than
+    /// `SessionFile.formatVersion` is refused, as a version 5 file is by a
+    /// reader whose `formatVersion` is 4. Then reopening such an item: one
+    /// whose bundle is gone is "not installed"; one naming nfp5 in the user's
+    /// CLAP directory, when it is installed there, is made from the registry,
+    /// registering the bundle from the item's path when the registry lacks it.
+    /// The item's component description is a placeholder: the CLAP id decides.
     static func records() throws {
         let clap = PluginId(type: "aumu", subtype: "test", manufacturer: "test",
                             clapId: "studio.whatissoftware.nfp5", clapPath: "/Library/Audio/Plug-Ins/CLAP/nfp5.clap")
@@ -178,39 +235,66 @@ enum Smoke {
         } catch let e as EngineError where e.message.contains("newer than this app understands") {
             print("  at format \(SessionFile.formatVersion + 1) under format \(SessionFile.formatVersion): refused (\(e.message))")
         }
+
+        let gone = PluginId(type: "aumu", subtype: "test", manufacturer: "test",
+                            clapId: "studio.whatissoftware.absent", clapPath: dir.appendingPathComponent("absent.clap").path)
+        do {
+            _ = try wait { try await PluginInstance.make(gone) }
+            throw EngineError("a CLAP plugin whose bundle is gone was made")
+        } catch let e as EngineError where e.message == "absent: CLAP plugin not installed" {
+            print("  reopening a CLAP item whose bundle is gone: \(e.message)")
+        }
+        let bundle = Plugins.clapDirectories[0] + "/nfp5.clap"
+        guard FileManager.default.fileExists(atPath: bundle) else {
+            print("  nfp5 is not installed at \(bundle); the reopen check is skipped")
+            return
+        }
+        let registered = Plugins.registeredClap(nfp5) != nil
+        let item = PluginId(type: "aumu", subtype: "test", manufacturer: "test", clapId: nfp5, clapPath: bundle)
+        let unit = try wait { try await PluginInstance.make(item) }
+        print("  reopening a CLAP item naming \(bundle), \(registered ? "registered by the scan" : "not registered: registered from its path"): "
+              + "\(unit.id.type) \(unit.id.subtype) \(unit.id.manufacturer) from \(unit.id.clapPath), \(describe(unit))")
+        guard unit.isV3, unit.id.clapId == nfp5, unit.id.clapPath == bundle, unit.id.isInstrument, Plugins.registeredClap(nfp5) == unit.id else {
+            throw EngineError("a CLAP item did not reopen as the registered plugin")
+        }
     }
 
     /// Audio and MIDI together: a device input with a MIDI source builds and
-    /// runs, with a ring per plugin that takes MIDI (none of Apple's effects
-    /// do); Apple's DLS synth heads the chain beside the device input, which
-    /// it has no bus for, so the engine reports the audio input unused;
-    /// `instrument` (`PC_INSTRUMENT`, one with an input bus, such as a
-    /// vocoder) takes the device input on that bus; the session round-trips
-    /// at format version 4, and the same records under an older version read
-    /// as MIDI instead of audio.
+    /// runs, with a ring per plugin that takes MIDI (the chain's instrument
+    /// and music effects; none of Apple's effects take it); unless the chain
+    /// has an instrument of its own, Apple's DLS synth heads it beside the
+    /// device input, which it has no bus for, so the engine reports the audio
+    /// input unused; `instrument` (`PC_INSTRUMENT`, one with an input bus,
+    /// such as a vocoder) takes the device input on that bus; the session
+    /// round-trips at format version 4 (5 with a CLAP plugin), and the same
+    /// records under an older version read as MIDI instead of audio.
     private static func both(_ devices: [Device], _ inp: Device, _ out: Device, _ units: [PluginInstance], _ chain: [ChainItem], instrument: Plugin?) throws {
         let input = Endpoint(deviceUid: inp.uid, channels: Array(0..<min(inp.inputChannels, 2)), midiSource: "*", midiSourceName: MidiInput.allSourcesName)
         let outFirst: UInt32 = inp.uid == out.uid && out.outputChannels >= 4 ? 2 : 0
         let output = Endpoint(deviceUid: out.uid, channels: Array(outFirst..<outFirst + min(out.outputChannels, 2)))
         let fanout = pc_midi_fanout_new()!
+        let musicEffects = units.filter { $0.id.type == "aumf" }.count
+        let ownInstrument = chain.first?.plugin.isInstrument == true
         do {
-            let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
-            let engine = try Engine(input: input, output: output, devices: devices, stages: stages, midi: fanout)
+            let engine = try Engine(input: input, output: output, devices: devices, stages: engineStages(units, chain), midi: fanout)
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
             let s = engine.status
-            let receivers = units.filter { $0.id.type == "aumf" }.count
-            print("Audio and MIDI: \(inp.name) + MIDI -> \(chain.count) plugins -> \(out.name): rings \(engine.midiRingCount) for \(receivers) music effects, errors \(s.renderErrors)")
+            let receivers = musicEffects + (ownInstrument ? 1 : 0)
+            print("Audio and MIDI: \(inp.name) + MIDI -> \(chain.count) plugins -> \(out.name): rings \(engine.midiRingCount) for \(receivers) instruments and music effects, audio input unused \(engine.audioInputUnused), errors \(s.renderErrors)")
             guard engine.midiRingCount == receivers, s.renderErrors == 0 else { throw EngineError("Audio and MIDI: the chain did not run with both") }
         }
-        let dls = try wait { try await PluginInstance.make(PluginId(type: "aumu", subtype: "dls ", manufacturer: "appl")) }
-        do {
-            let stages = [Engine.Stage(unit: dls.audioUnit, bypass: false, gainDb: 0, isInstrument: true)]
-                + zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
+        var dls: PluginInstance?
+        if ownInstrument {
+            print("Audio and MIDI: the chain has its own instrument at the head; no DLS synth is put before it")
+        } else {
+            let synth = try wait { try await PluginInstance.make(PluginId(type: "aumu", subtype: "dls ", manufacturer: "appl")) }
+            dls = synth
+            let stages = [Engine.Stage(unit: synth.audioUnit, bypass: false, gainDb: 0, isInstrument: true)] + engineStages(units, chain)
             let engine = try Engine(input: input, output: output, devices: devices, stages: stages, midi: fanout)
             RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.5))
             let s = engine.status
             print("Audio and MIDI: \(inp.name) + MIDI -> DLSMusicDevice -> \(chain.count) plugins -> \(out.name): rings \(engine.midiRingCount), audio input unused \(engine.audioInputUnused), errors \(s.renderErrors)")
-            guard engine.audioInputUnused, engine.midiRingCount == 1 + units.filter({ $0.id.type == "aumf" }).count, s.renderErrors == 0 else {
+            guard engine.audioInputUnused, engine.midiRingCount == 1 + musicEffects, s.renderErrors == 0 else {
                 throw EngineError("Audio and MIDI: the DLS synth did not run beside the device input with it unused")
             }
         }
@@ -233,8 +317,9 @@ enum Smoke {
         try SessionFile.write(session, to: url)
         var back = try SessionFile.read(url)
         let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
+        let expected = chain.contains { $0.plugin.isClap } ? 5 : 4  // a CLAP plugin outranks audio and MIDI together
         print("Audio and MIDI session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
-        guard back == session, version == 4 else { throw EngineError("Audio and MIDI session did not round-trip at version 4") }
+        guard back == session, version == expected else { throw EngineError("Audio and MIDI session did not round-trip at version \(expected)") }
         // The same records under an older version: a MIDI source then meant no audio input.
         try DB(url, create: false).exec("PRAGMA user_version = 2")
         back = try SessionFile.read(url)
@@ -245,9 +330,9 @@ enum Smoke {
     /// None output: the input device clocks a chain that goes nowhere. Then
     /// None input too: with no device at all the timer clocks it, at its own
     /// rate, and follows a buffer size change live. Neither may have render
-    /// errors. A None session round-trips at format version 3.
+    /// errors. A None session round-trips at format version 3, or 5 with a CLAP plugin.
     private static func none(_ devices: [Device], _ inp: Device, _ units: [PluginInstance], _ chain: [ChainItem]) throws {
-        let stages = zip(units, chain).map { Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, owner: $0) }
+        let stages = engineStages(units, chain)
         let input = Endpoint(deviceUid: inp.uid, channels: Array(0..<min(inp.inputChannels, 2)))
         do {
             let engine = try Engine(input: input, output: .none, devices: devices, stages: stages)
@@ -286,8 +371,9 @@ enum Smoke {
         try SessionFile.write(session, to: url)
         let back = try SessionFile.read(url)
         let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
+        let expected = chain.contains { $0.plugin.isClap } ? 5 : 3  // a CLAP plugin outranks None
         print("None session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
-        guard back == session, version == 3 else { throw EngineError("None session did not round-trip at version 3") }
+        guard back == session, version == expected else { throw EngineError("None session did not round-trip at version \(expected)") }
     }
 
     /// `PC_MIDI=1`: a virtual MIDI source plays Apple's DLS synth, the chain
@@ -298,8 +384,10 @@ enum Smoke {
     /// selected. Two effects follow the synth; reordering them live (the
     /// instrument stays at position 0) must keep the output sounding. Then
     /// the None endpoints, a MIDI source beside a device input, and a MIDI
-    /// session round-tripping through a file.
-    private static func midi(_ devices: [Device], _ out: Device) throws {
+    /// session round-tripping through a file. When `clap` (nfp5) is installed,
+    /// it heads the chain in place of the DLS synth for one more pass, and
+    /// the app model adds it, plays it, saves it, and reopens it.
+    private static func midi(_ devices: [Device], _ out: Device, clap: Plugin?) throws {
         DispatchQueue.global().asyncAfter(deadline: .now() + 60) {
             print("FAIL: watchdog: MIDI smoke still running after 60 s")
             _exit(1)
@@ -386,6 +474,32 @@ enum Smoke {
         input.active = 0
         engine = nil  // tears down, uninitializing the plugins for the next graph
         withExtendedLifetime(units) {}  // the engine does not own its plugins
+
+        // A CLAP instrument in place of the DLS synth: the source's note reaches it through
+        // its ring, MusicDeviceMIDIEvent, and the bridge, which sends it CLAP note events.
+        if let clap {
+            let synth = try wait { try await PluginInstance.make(clap.id) }
+            print("  \(clap.name) (CLAP \(clap.id.clapId)): \(describe(synth))")
+            let stages = [Engine.Stage(unit: synth.audioUnit, bypass: false, gainDb: 0, isInstrument: true, owner: synth)]
+                + units.dropFirst().map { Engine.Stage(unit: $0.audioUnit, bypass: false, gainDb: 0, owner: $0) }
+            engine = try Engine(input: session.input, output: session.output, devices: devices, stages: stages, midi: input.fanout)
+            input.active = engine.midiRingCount
+            try play("\(clap.name) (CLAP) by source ID", selection: "\(sourceID)", toDestination: false)
+            run(0.2)
+            var info = pc_clap_unit_info()
+            guard let av = synth.avUnit, pc_clap_unit_read_info(Unmanaged.passUnretained(av.auAudioUnit).toOpaque(), &info) else {
+                throw EngineError("MIDI: \(clap.name) is not a bridged CLAP plugin")
+            }
+            print("  \(clap.name): MIDI render events \(info.midi_render_events), CLAP note events \(info.note_events), dropped \(info.dropped_events), render errors \(engine.status.renderErrors)")
+            guard info.midi_render_events >= 2, info.note_events >= 2, info.dropped_events == 0, engine.status.renderErrors == 0 else {
+                throw EngineError("MIDI: the note did not reach \(clap.name) as CLAP note events")
+            }
+            input.active = 0
+            engine = nil
+            withExtendedLifetime(units) {}
+        } else {
+            print("MIDI: nfp5 (CLAP) is not installed; the pass with it at the head is skipped")
+        }
 
         // One output channel: the instrument still renders stereo; the converter downmixes.
         do {
@@ -490,15 +604,17 @@ enum Smoke {
         let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
         print("MIDI session round trip:", back == session ? "ok" : "MISMATCH", "format version:", version)
         guard back == session, version == 2 else { throw EngineError("MIDI session did not round-trip") }
-        try MainActor.assumeIsolated { try midiModel(url, system: system, source: source, sourceID: sourceID, session: session, out: out) }
+        try MainActor.assumeIsolated { try midiModel(url, system: system, source: source, sourceID: sourceID, session: session, out: out, clap: clap) }
         print("PASS")
     }
 
     /// The app model with MIDI: the unused-MIDI hint, loading a MIDI session,
     /// playing it, switching sources (and off) without a rebuild, refused
     /// moves, the None endpoints, and a MIDI source beside a device input.
+    /// With `clap`, the CLAP instrument is added from the model's plugin list,
+    /// plays, is saved with a parameter changed, and reopens with it.
     @MainActor
-    private static func midiModel(_ url: URL, system: MidiSystem, source: MIDIEndpointRef, sourceID: Int32, session: Session, out: Device) throws {
+    private static func midiModel(_ url: URL, system: MidiSystem, source: MIDIEndpointRef, sourceID: Int32, session: Session, out: Device, clap: Plugin?) throws {
         func run(_ seconds: Double) { RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds)) }
         func until(_ what: String, _ seconds: Double, _ ok: () -> Bool) throws {
             let deadline = Date(timeIntervalSinceNow: seconds)
@@ -661,8 +777,84 @@ enum Smoke {
             throw EngineError("model: MIDI off with an instrument beside a device input: flips \(addedFlips), hint \(model.hint ?? "nil")")
         }
         print("model: an instrument added beside a device input plays, with the hint \"\(model.hint ?? "")\"; MIDI off is no rebuild and keeps it")
+        if let clap { try midiModelClap(model, clap, url: url, send: send, until: until) }
         model.enabled = false
         run(0.2)
+    }
+
+    /// The CLAP instrument `clap` in the app model, in place of the DLS synth at
+    /// the head beside the device input: the model's plugin list offers it,
+    /// adding it plays it, and the session saved with one of its parameters
+    /// changed reopens with that value, unedited, and plays again.
+    @MainActor
+    private static func midiModelClap(_ model: Model, _ clap: Plugin, url: URL, send: (UInt32) -> Void,
+                                      until: (String, Double, () -> Bool) throws -> Void) throws {
+        func run(_ seconds: Double) { RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds)) }
+        guard let listed = model.plugins.first(where: { $0.id.clapId == clap.id.clapId }), listed.isInstrument else {
+            throw EngineError("model: the plugin list does not offer \(clap.name) as an instrument")
+        }
+        model.remove(at: [0])
+        try until("DLS synth removed", 3) { model.session.chain.count == 2 && !model.hasInstrument && model.status.running && model.error == nil }
+        model.add(listed)
+        try until("\(clap.name) added", 5) {
+            model.session.chain.count == 3 && model.session.chain[0].plugin == listed.id && model.status.running && model.error == nil
+                && model.hint == Model.audioUnusedHint(clap.name)
+        }
+        guard model.hasMidi, model.name(of: model.session.chain[0].plugin) == clap.name else {
+            throw EngineError("model: \(clap.name) added: MIDI \(model.hasMidi), named \(model.name(of: model.session.chain[0].plugin))")
+        }
+        func played(_ label: String) throws {
+            let head = model.session.chain[0].id
+            try until("\(label): quiet", 5) { (model.levels.peaks[head]?.max() ?? 1) < 0.001 }
+            send(0x2090_3C64)
+            try until("\(label): \(clap.name) meter", 3) { (model.levels.peaks[head]?.max() ?? 0) > 0.01 }
+            let meter = model.levels.peaks[head]?.max() ?? 0
+            send(0x2080_3C00)
+            print(String(format: "model: %@: %@ (CLAP) meter %.3f", label, clap.name, meter))
+        }
+        try played("added from the plugin list")
+
+        // A parameter changed through the C API, as the smoke's chain check sets one, is in the saved state.
+        guard let unit = model.instance(for: model.session.chain[0].id),
+              let p = Plugins.v2Parameters(unit.audioUnit).first(where: {
+                  AudioUnitParameterOptions(rawValue: $0.flags).contains(.flag_IsWritable) && $0.unit != AudioUnitParameterUnit.indexed.rawValue && $0.min < $0.max
+              })
+        else { throw EngineError("model: \(clap.name) has no writable continuous parameter") }
+        var before: AudioUnitParameterValue = 0
+        AudioUnitGetParameter(unit.audioUnit, p.id, kAudioUnitScope_Global, 0, &before)
+        let target = p.max - before > before - p.min ? p.max : p.min
+        var param = AudioUnitParameter(mAudioUnit: unit.audioUnit, mParameterID: p.id, mScope: kAudioUnitScope_Global, mElement: 0)
+        AUParameterSet(nil, nil, &param, target, 0)
+        run(0.3)
+        // Saved to the session file the model has open; an untitled one would put up a save panel.
+        guard model.sessionURL == url else { throw EngineError("model: the session open is not \(url.lastPathComponent)") }
+        guard model.saveSession() else { throw EngineError("model: saving the session with \(clap.name): \(model.error ?? "failed")") }
+        let saved = try SessionFile.read(url)
+        let version = try DB(url, create: false).scalarInt("PRAGMA user_version")
+        guard saved.chain.first?.plugin == listed.id, saved.chain.first?.state != nil, version == 5 else {
+            throw EngineError("model: the saved session does not hold \(clap.name) with its state at version 5 (version \(version))")
+        }
+        print("model: saved with \(clap.name) at format version \(version), '\(p.name)' set from \(before) to \(target)")
+
+        try wait { await model.open(url, quietly: false) }
+        try until("session with \(clap.name) reopened", 5) {
+            model.status.running && model.error == nil && model.session.chain.count == 3 && model.session.chain[0].plugin == listed.id && !model.dirty
+        }
+        run(0.5)  // let any plugin notifications from loading state and building the graph arrive
+        guard let reopened = model.instance(for: model.session.chain[0].id), reopened !== unit else {
+            throw EngineError("model: \(clap.name) was not made again when the session reopened")
+        }
+        var after: AudioUnitParameterValue = 0
+        AudioUnitGetParameter(reopened.audioUnit, p.id, kAudioUnitScope_Global, 0, &after)
+        guard after == target, !model.dirty else {
+            throw EngineError("model: reopened \(clap.name) has '\(p.name)' \(after), not \(target) (edited \(model.dirty))")
+        }
+        print("model: the session reopened with \(clap.name), '\(p.name)' \(after), unedited")
+        // Back to where it was, so the note below sounds as the first one did (a long attack would be slow to reach the meter).
+        var restored = AudioUnitParameter(mAudioUnit: reopened.audioUnit, mParameterID: p.id, mScope: kAudioUnitScope_Global, mElement: 0)
+        AUParameterSet(nil, nil, &restored, before, 0)
+        run(0.3)
+        try played("reopened")
     }
 
     /// Device-list listener check: create and destroy aggregates and see the
@@ -697,6 +889,13 @@ enum Smoke {
         print("listener: private aggregate fired \(fired - before), in our device list: \(listed)")
         _ = listener
         guard created > 0 else { throw EngineError("device-list listener never fired") }
+    }
+
+    /// The engine's stages for a chain, an instrument at its head marked as one.
+    private static func engineStages(_ units: [PluginInstance], _ chain: [ChainItem]) -> [Engine.Stage] {
+        zip(units, chain).map {
+            Engine.Stage(unit: $0.audioUnit, bypass: $1.bypass, gainDb: $1.inputGainDb, isInstrument: $1.plugin.isInstrument, owner: $0)
+        }
     }
 
     private static func describe(_ unit: PluginInstance) -> String {

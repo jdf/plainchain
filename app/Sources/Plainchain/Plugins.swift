@@ -1,8 +1,11 @@
 import AVFoundation
+import ClapHost
 import Foundation
 
-/// An installed Audio Unit effect or instrument. A CLAP plugin's `id` carries
-/// its CLAP identity (`PluginId.clapId` and `clapPath`).
+/// An installed Audio Unit or CLAP plugin: an effect or an instrument. A CLAP
+/// plugin's `id` carries its CLAP identity (`PluginId.clapId` and `clapPath`)
+/// beside the component description it is registered under, and its
+/// manufacturer is the CLAP vendor.
 struct Plugin: Identifiable, Hashable {
     let id: PluginId
     let name: String
@@ -11,21 +14,90 @@ struct Plugin: Identifiable, Hashable {
 }
 
 enum Plugins {
-    /// Every installed effect (`aufx`), music-effect (`aumf`), and instrument (`aumu`) Audio Unit.
+    /// Where CLAP plugins are installed, the user's own first: a plugin in both
+    /// is registered from the user's.
+    static var clapDirectories: [String] {
+        [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Audio/Plug-Ins/CLAP").path,
+         "/Library/Audio/Plug-Ins/CLAP"]
+    }
+
+    /// Registers every CLAP plugin under `clapDirectories` as an in-process
+    /// Audio Unit. A plugin registered before stays as it is, so a rescan
+    /// registers only what was installed since. Main thread.
+    static func registerClap() {
+        for directory in clapDirectories { _ = pc_clap_scan(directory) }
+    }
+
+    /// Every installed effect (`aufx`), music-effect (`aumf`), and instrument
+    /// (`aumu`) Audio Unit, then every registered CLAP plugin. A plugin installed
+    /// in both formats is listed once for each; the components registered for
+    /// CLAP plugins are listed only as CLAP plugins.
     static func installed() -> [Plugin] {
         let manager = AVAudioUnitComponentManager.shared()
         var out: [Plugin] = []
         for type in [kAudioUnitType_Effect, kAudioUnitType_MusicEffect, kAudioUnitType_MusicDevice] {
             let wanted = AudioComponentDescription(componentType: type, componentSubType: 0, componentManufacturer: 0, componentFlags: 0, componentFlagsMask: 0)
             for c in manager.components(matching: wanted) {
-                let id = PluginId(c.audioComponentDescription)
+                let d = c.audioComponentDescription
+                var registered = pc_clap_plugin()
+                if pc_clap_lookup(d.componentType, d.componentSubType, d.componentManufacturer, &registered) { continue }
+                let id = PluginId(d)
                 out.append(Plugin(id: id, name: c.name, manufacturer: c.manufacturerName, isInstrument: id.isInstrument))
             }
         }
+        for i in 0..<pc_clap_count() {
+            var p = pc_clap_plugin()
+            guard pc_clap_plugin_at(i, &p) else { continue }
+            let id = clapId(p)
+            out.append(Plugin(id: id, name: String(cString: p.name), manufacturer: String(cString: p.vendor), isInstrument: id.isInstrument))
+        }
+        // Manufacturer, then name, then the Audio Unit before the CLAP plugin of the same name.
         return out.sorted {
             let m = $0.manufacturer.localizedCaseInsensitiveCompare($1.manufacturer)
-            return m == .orderedSame ? $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending : m == .orderedAscending
+            if m != .orderedSame { return m == .orderedAscending }
+            let n = $0.name.localizedCaseInsensitiveCompare($1.name)
+            if n != .orderedSame { return n == .orderedAscending }
+            return !$0.id.isClap && $1.id.isClap
         }
+    }
+
+    /// Before the process exits, once every plugin instance is gone (CLAP
+    /// probes included): deinitializes the CLAP bundles. Nothing does it at
+    /// exit, when a bundle's static storage may already be destroyed. With a
+    /// plugin still alive it does nothing; it says which happened.
+    static func shutdownClap() -> String {
+        pc_clap_shutdown() ? "CLAP bundles deinitialized" : "CLAP bundles left initialized: a plugin is still alive"
+    }
+
+    /// The identity of a registered CLAP plugin: the component description
+    /// registered for it, its CLAP id, and the bundle it was registered from.
+    private static func clapId(_ p: pc_clap_plugin) -> PluginId {
+        PluginId(type: FourCC.string(p.type), subtype: FourCC.string(p.subtype), manufacturer: FourCC.string(p.manufacturer),
+                 clapId: String(cString: p.clap_id), clapPath: String(cString: p.path))
+    }
+
+    /// The registered CLAP plugin with this CLAP id, as `installed()` lists it.
+    static func registeredClap(_ clapId: String) -> PluginId? {
+        for i in 0..<pc_clap_count() {
+            var p = pc_clap_plugin()
+            if pc_clap_plugin_at(i, &p), String(cString: p.clap_id) == clapId { return Self.clapId(p) }
+        }
+        return nil
+    }
+
+    /// The registered identity of the CLAP plugin `id` names, registering the
+    /// bundle at its `clapPath` first when the registry lacks the plugin (a
+    /// session naming a bundle outside `clapDirectories`, or one installed
+    /// since the last scan). The CLAP id decides: the registry's component
+    /// description and bundle path replace the ones `id` holds. Main thread.
+    static func registerClap(_ id: PluginId) throws -> PluginId {
+        if let registered = registeredClap(id.clapId) { return registered }
+        guard !id.clapPath.isEmpty, FileManager.default.fileExists(atPath: id.clapPath) else {
+            throw EngineError("\(id.fallbackName): CLAP plugin not installed")
+        }
+        guard pc_clap_register_bundle(id.clapPath) >= 0 else { throw EngineError("\(id.fallbackName): the CLAP bundle \(id.clapPath) could not be loaded") }
+        guard let registered = registeredClap(id.clapId) else { throw EngineError("\(id.fallbackName): \(id.clapPath) holds no plugin \(id.clapId)") }
+        return registered
     }
 
     /// A read-only parameter that reports gain reduction, if the plugin has one.

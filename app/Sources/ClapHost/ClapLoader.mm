@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -19,8 +18,8 @@
 
 namespace {
 
-/// A loaded bundle: its executable stays loaded, and its entry initialized,
-/// for the life of the process.
+/// A loaded bundle: its executable stays loaded for the life of the process,
+/// and its entry stays initialized until `pc_clap_shutdown`.
 struct Bundle {
     void *library = nullptr;
     const clap_plugin_entry_t *entry = nullptr;
@@ -58,12 +57,6 @@ std::vector<std::unique_ptr<Registered>> &Registry() {
 
 /// Plugins created and not yet destroyed, probes included.
 int g_live_plugins = 0;
-
-/// At exit, with no plugin left, every loaded entry is deinitialized once.
-void DeinitBundles() {
-    if (g_live_plugins != 0) return;
-    for (auto &[path, bundle] : Bundles()) bundle.entry->deinit();
-}
 
 bool IsMainThread() { return pthread_main_np() != 0; }
 
@@ -115,11 +108,6 @@ const Bundle *LoadBundle(const char *path) {
         entry->deinit();
         dlclose(library);
         return nullptr;
-    }
-    static bool registered_exit = false;
-    if (!registered_exit) {
-        std::atexit(DeinitBundles);
-        registered_exit = true;
     }
     Bundle &bundle = Bundles()[path];
     bundle = Bundle{library, entry, factory};
@@ -212,6 +200,26 @@ void Fill(const Registered &r, pc_clap_plugin *out) {
     *out = pc_clap_plugin{r.path.c_str(), r.clap_id.c_str(), r.name.c_str(), r.vendor.c_str(), r.type, r.subtype, r.manufacturer};
 }
 
+/// Registers every .clap bundle in `dir` and in the folders under it, as
+/// the CLAP entry header asks of a host. A bundle is not searched inside,
+/// and a symbolic link to a folder is not followed; hidden entries are skipped.
+int ScanDirectory(NSString *dir) {
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSArray<NSString *> *names = [[files contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(compare:)];
+    int total = 0;
+    for (NSString *name in names) {
+        if ([name hasPrefix:@"."]) continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        if ([name.pathExtension isEqualToString:@"clap"]) {
+            int count = pc_clap_register_bundle(path.fileSystemRepresentation);
+            if (count > 0) total += count;
+        } else if ([[files attributesOfItemAtPath:path error:nil].fileType isEqualToString:NSFileTypeDirectory]) {
+            total += ScanDirectory(path);
+        }
+    }
+    return total;
+}
+
 }  // namespace
 
 namespace pc_clap {
@@ -266,17 +274,16 @@ int pc_clap_register_bundle(const char *path) {
     return static_cast<int>(count);
 }
 
-int pc_clap_scan(const char *directory) {
-    NSString *dir = @(directory);
-    NSArray<NSString *> *names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil]
-        sortedArrayUsingSelector:@selector(compare:)];
-    int total = 0;
-    for (NSString *name in names) {
-        if (![name.pathExtension isEqualToString:@"clap"]) continue;
-        int count = pc_clap_register_bundle([dir stringByAppendingPathComponent:name].fileSystemRepresentation);
-        if (count > 0) total += count;
+int pc_clap_scan(const char *directory) { return ScanDirectory(@(directory)); }
+
+bool pc_clap_shutdown(void) {
+    if (g_live_plugins != 0) {
+        NSLog(@"CLAP: %d plugin(s) still alive at shutdown; the bundles stay initialized", g_live_plugins);
+        return false;
     }
-    return total;
+    for (auto &[path, bundle] : Bundles()) bundle.entry->deinit();
+    Bundles().clear();
+    return true;
 }
 
 int pc_clap_count(void) { return static_cast<int>(Registry().size()); }

@@ -177,7 +177,8 @@ final class Model: ObservableObject {
         if session.input.isDevice { return session.input.channels.count }
         return session.output.isNone || session.output.channels.count >= 2 ? 2 : 1
     }
-    func name(of id: PluginId) -> String { plugin(id)?.name ?? "\(id.manufacturer) \(id.subtype)" }
+    /// The installed plugin's name; for one that is not installed, `PluginId.fallbackName`.
+    func name(of id: PluginId) -> String { plugin(id)?.name ?? id.fallbackName }
     func isEditorOpen(_ id: UUID) -> Bool { editors[id] != nil }
     /// The loaded plugin for a chain item (for the headless checks).
     func instance(for id: UUID) -> PluginInstance? { instances[id] }
@@ -378,7 +379,7 @@ final class Model: ObservableObject {
         devicesChanged()
     }
 
-    /// Re-read the installed Audio Units from the system registry.
+    /// Re-read the installed Audio Units and rescan the CLAP directories.
     func refreshPlugins() { app.refreshPlugins() }
 
     // MARK: Sessions
@@ -508,6 +509,7 @@ final class Model: ObservableObject {
                 let unit = try await PluginInstance.make(item.plugin)
                 if let data = item.state { unit.state = data }
                 item.state = nil
+                item.plugin = unit.id  // a CLAP plugin as registered: the bundle it was loaded from
                 register(unit, for: item.id)  // observes from here on, so loading the state does not count as an edit
                 kept.append(item)
             } catch {

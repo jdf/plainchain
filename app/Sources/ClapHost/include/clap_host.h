@@ -12,7 +12,8 @@
 extern "C" {
 #endif
 
-/* Registers every plugin of every .clap bundle in `directory`; returns how many plugins the bundles hold. */
+/* Registers every plugin of every .clap bundle in `directory` and the folders under it; returns how many
+   plugins the bundles hold. A plugin registered before stays as it is, so a repeated scan registers only what is new. */
 int pc_clap_scan(const char *directory);
 /* Registers the plugins of the bundle at `path`; returns how many it holds, or -1 when it cannot be loaded.
    A plugin registered before stays as it is. */
@@ -28,6 +29,12 @@ typedef struct pc_clap_plugin {
     uint32_t subtype;
     uint32_t manufacturer;
 } pc_clap_plugin;
+
+/* Before the process exits, after every plugin instance (every ClapAudioUnit, probes included) is destroyed:
+   deinitializes each loaded bundle's entry and forgets the bundle, whose executable stays loaded; a later
+   registration or instance initializes it again. While a plugin is alive it does nothing and returns false.
+   Nothing deinitializes the entries at exit on its own, when a bundle's static storage may already be gone. */
+bool pc_clap_shutdown(void);
 
 int pc_clap_count(void);
 bool pc_clap_plugin_at(int index, pc_clap_plugin *out);

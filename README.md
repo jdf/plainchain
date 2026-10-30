@@ -31,7 +31,7 @@ Sessions (devices, chain, and every plugin's state) save to `.plainchain` files:
 | `app/Sources/Plainchain/ContentView.swift` | A session window's contents. |
 | `app/Sources/Plainchain/Smoke.swift` | Headless engine check (`--smoke`, including the None output, no-device clock, and audio-plus-MIDI checks; with `PC_MIDI=1`, the MIDI check). |
 | `app/Sources/Plainchain/HotplugTest.swift` | Headless device hot-plug and two-session check (`--hotplug-test`), run in the test VM. |
-| `tools/testvm.sh` | Runs things in Plainchain's Tart test VM, `plainchain-tests`, through the testvm repository's tool (`~/projects/testvm`, github.com/jdf/testvm): `up`/`down` the guest, `push` the bundle, `run` a command, `hotplug`, `midi`. |
+| `tools/testvm.sh` | Runs things in Plainchain's Tart test VM, `plainchain-tests`, through the testvm repository's tool (`~/projects/testvm`, github.com/jdf/testvm): `up`/`down` the guest, `push` the bundle, `run` a command, `hotplug`, `midi`, `clap`. |
 | `tools/provision-testvm.sh` | Provisions that guest, under the tool's `provision`: installs BlackHole 16ch and grants `com.plainchain.app` the microphone. |
 | `Makefile` | Builds and assembles `build/Plainchain.app`. |
 
@@ -42,6 +42,7 @@ make run        # swift build, bundle, open
 make smoke      # headless: default in -> out for 2 s, a session round trip, the chain to None output, with no device at all, and with a MIDI source beside the input
 make hotplug-test  # headless, in the Tart test VM: unplug and replug a fake interface under a running session, then two sessions side by side
 make midi-test  # headless, in the Tart test VM: a virtual MIDI source plays Apple's DLS synth into BlackHole
+make clap-vm-test  # headless, in the Tart test VM: the smoke with the CLAP instrument nfp5 at the head, copied in from ~/Library/Audio/Plug-Ins/CLAP
 PC_IN="Loopback" PC_OUT="MacBook Air Speakers" make smoke PLUGINS="AUDelay AUGraphicEQ"
 ```
 
@@ -73,7 +74,7 @@ The app listens for HAL device-list changes. When a session device disappears, o
 
 ### The test VM
 
-The guest is Plainchain's own Tart VM, `plainchain-tests`, whose lifecycle belongs to the testvm repository, cloned at `~/projects/testvm` (or `TESTVM_DIR`); the header of `tools/testvm.sh` says how to make it again. It must be booted with `--no-audio` (that tool's `up`, which `tools/testvm.sh up` runs, does that): otherwise its "Apple Virtual Sound Device" passes straight through to the host's speakers and microphone. It needs the BlackHole 16ch loopback driver and the microphone grant for `com.plainchain.app`, and `tools/provision-testvm.sh` (run through the tool's `provision`) is what puts both there. Every audio test targets BlackHole by name (`PC_IN=BlackHole PC_OUT=BlackHole`, a name substring), never the default devices. BlackHole loops each output channel back into the same input channel, so the tests never write a channel they read: a session reads 1-2 and writes 3-4, and a second session writes 5-6. The nested-aggregate scenario stays best-effort: with BlackHole in both roles the private aggregate (the fake interface plus BlackHole) never reports the channel count the engine waits for ("has 16 output channels, not yet 20"), so the refusal is reported and not counted.
+The guest is Plainchain's own Tart VM, `plainchain-tests`, whose lifecycle belongs to the testvm repository, cloned at `~/projects/testvm` (or `TESTVM_DIR`); the header of `tools/testvm.sh` says how to make it again. It must be booted with `--no-audio` (that tool's `up`, which `tools/testvm.sh up` runs, does that): otherwise its "Apple Virtual Sound Device" passes straight through to the host's speakers and microphone. It needs the BlackHole 16ch loopback driver and the microphone grant for `com.plainchain.app`, and `tools/provision-testvm.sh` (run through the tool's `provision`) is what puts both there. Every audio test targets BlackHole by name (`PC_IN=BlackHole PC_OUT=BlackHole`, a name substring), never the default devices. BlackHole loops each output channel back into the same input channel, so the tests never write a channel they read: a session reads 1-2 and writes 3-4, and a second session writes 5-6. The nested-aggregate scenario stays best-effort: with BlackHole in both roles the private aggregate (the fake interface plus BlackHole) never reports the channel count the engine waits for ("has 16 output channels, not yet 20"), so the refusal is reported and not counted. `tools/testvm.sh clap` (`make clap-vm-test`) copies `~/Library/Audio/Plug-Ins/CLAP/nfp5.clap` into the guest's own CLAP directory, where it stays, and runs `Plainchain --smoke nfp5` on BlackHole; with it there, `make midi-test` also plays nfp5 in place of the DLS synth.
 
 Effects are wired with `kAudioUnitProperty_MakeConnection`. The first effect's render callback pulls the current IO cycle's input straight from the HAL unit into the effect's own buffers, so there is no intermediate buffer and no added latency beyond the device's own.
 
