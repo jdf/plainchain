@@ -863,13 +863,15 @@ enum Smoke {
     }
 
     /// Device-list listener check: create and destroy aggregates and see the
-    /// callback arrive on the main queue. A public one must fire it; a private
-    /// one is reported, along with whether it shows up in our own device list.
+    /// callback arrive, off the main thread (on the main queue it deadlocks
+    /// the app when a device dies; see `HAL.Listener`). A public one must fire
+    /// it; a private one is reported, along with whether it shows up in our
+    /// own device list.
     private static func listen(_ out: Device) throws {
         var fired = 0
         let listener = try HAL.listen(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDevices) {
-            precondition(Thread.isMainThread, "listener called off the main thread")
-            fired += 1
+            precondition(!Thread.isMainThread, "listener called on the main thread")
+            DispatchQueue.main.async { fired += 1 }
         }
         let description: [String: Any] = [
             "name": "Plainchain smoke",

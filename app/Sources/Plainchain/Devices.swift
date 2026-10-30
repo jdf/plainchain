@@ -120,23 +120,35 @@ enum HAL {
     }
 
     /// A property listener on a HAL object; removed when this is released.
+    ///
+    /// Delivered on `Listener.queue`, never on the main queue. For an address
+    /// the HAL counts as realtime (`DeviceIsAlive` is one) it delivers with
+    /// `dispatch_sync`, and until that delivery returns it lets nobody remove
+    /// a listener from the object. On the main queue that deadlocks the app
+    /// when a device dies while the main thread is tearing down the engine:
+    /// the HAL unit's disposal removes its own listeners from the dying device
+    /// and waits for the delivery to our listener, which waits for main
+    /// (whatissoftware-issues #21). The handler hops to the main actor itself.
     final class Listener {
+        /// The one serial queue every listener is delivered on.
+        fileprivate static let queue = DispatchQueue(label: "plainchain.hal.listeners")
         private let object: AudioObjectID
         private var addr: AudioObjectPropertyAddress
         private let block: AudioObjectPropertyListenerBlock
 
-        fileprivate init(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ handler: @escaping () -> Void) throws {
+        fileprivate init(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ handler: @escaping @Sendable () -> Void) throws {
             self.object = object
             addr = HAL.address(selector)
             block = { _, _ in handler() }
-            try check(AudioObjectAddPropertyListenerBlock(object, &addr, .main, block), "listen \(FourCC.string(selector))")
+            try check(AudioObjectAddPropertyListenerBlock(object, &addr, Self.queue, block), "listen \(FourCC.string(selector))")
         }
 
-        deinit { AudioObjectRemovePropertyListenerBlock(object, &addr, .main, block) }
+        deinit { AudioObjectRemovePropertyListenerBlock(object, &addr, Self.queue, block) }
     }
 
-    /// Call `handler` on the main queue whenever `selector` (global scope) of `object` changes.
-    static func listen(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ handler: @escaping () -> Void) throws -> Listener {
+    /// Call `handler` on a private serial queue, never the main thread,
+    /// whenever `selector` (global scope) of `object` changes.
+    static func listen(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ handler: @escaping @Sendable () -> Void) throws -> Listener {
         try Listener(object, selector, handler)
     }
 }
