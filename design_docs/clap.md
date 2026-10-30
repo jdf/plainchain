@@ -273,3 +273,56 @@ both pass.
 ## Status
 
 - 2026-10-29: plan written. K1 and K2 started.
+- 2026-10-29: K1 done in `09efb44f`: `Plainchain --clap-test <bundle>`
+  (`make clap-test`, nfp5 by default) passes on the host with no device
+  opened. What the bridge delivers:
+  - Registration: `AudioComponentFindNext` finds a registered plugin,
+    with `kAudioComponentFlag_IsV3AudioUnit` set (flags 0x14), and
+    `AVAudioUnitComponentManager` lists it. `AVAudioUnit.instantiate`
+    makes an `AVAudioUnitMIDIInstrument` around the `ClapAudioUnit`; its
+    completion and the plugin's creation both run on the main thread.
+    philinabox, with no note port, is registered as `aufx` after a
+    probe instance is asked for its note ports.
+  - MIDI: `MusicDeviceMIDIEvent` on the unit's C handle reaches the
+    render block as an `AURenderEventMIDI` through the base class's
+    `scheduleMIDIEventBlock`; no override is needed. nfp5 takes CLAP note
+    events: a note on peaks at -18.1 dBFS, and a second after the note
+    off the output is digital silence.
+  - Render: `AudioUnitRender` through the C API; with null `mData` the
+    unit points the list at its own buffers. A mono output format is
+    refused when it is set, with `kAudioUnitErr_FormatNotSupported`.
+  - Parameter IDs: the C API's IDs (`kAudioUnitProperty_ParameterList`,
+    `AudioUnitSetParameter`, `AUParameterSet`) are not the tree's
+    addresses. AudioToolbox derives each from the parameter's key path
+    and ignores the address: the IDs stayed the same with the addresses
+    replaced by 0 to 49, and changed with the identifiers. The addresses
+    stay the CLAP ids, and Plainchain already takes the C API's IDs from
+    the unit's own list. A key path holds the group identifier ("g" and
+    the module's position), so a plugin version that inserts a module
+    changes those IDs; Plainchain stores none of them.
+  - Parameter values: `AUParameterSet` on an initialized unit reaches
+    the render block as an `AURenderEventParameter`, not through
+    `implementorValueObserver`; on an uninitialized one it reaches
+    `implementorValueObserver`, which flushes it to the plugin, and the
+    tree's observers hear it. A value the plugin reports is set on the
+    tree on the main thread and is not sent back to the plugin.
+  - Observers: the tree calls its observers on an AudioToolbox thread,
+    as Apple documents ("an arbitrary thread context"), with the
+    parameter's current value, which the bridge reads from the plugin
+    through `get_value`. The main thread is where the bridge sets the
+    value; `PluginInstance.startObserving` already moves the
+    notification to the main thread.
+  - State: `fullState` holds `clap-state` (1755 bytes for nfp5) beside
+    the base class's `data`, `manufacturer`, `subtype`, `type`, and
+    `version`, and reads back equal from a fresh instance. While the
+    bytes are present, the parameter values the base class restores
+    stay in the tree and none reach the plugin.
+  - Identifiers: `AUParameterTree` throws for two parameters at one
+    address (an experiment aborted the test that way once). Parameters
+    are "p" and the CLAP id, groups "g" and their position; a repeated
+    CLAP id is left out, and a tree the framework refuses leaves the
+    unit with no parameters, logged.
+  - Not exercised by nfp5 (no input port, a fixed stereo output, no
+    latency): pulling the input bus, bypass,
+    `clap.configurable-audio-ports`, a latency change, and a parameter
+    rescan.
