@@ -1,3 +1,4 @@
+import AppKit
 import AudioToolbox
 import AVFoundation
 import ClapHost
@@ -10,8 +11,8 @@ import Foundation
 /// does, and drives it through the C API the engine uses: the stream format,
 /// maximum frames, `AudioUnitInitialize`, `MusicDeviceMIDIEvent`, and
 /// `AudioUnitRender`. Then its parameter tree, its full state on a fresh
-/// instance, and a parameter value reported from inside the plugin. Prints
-/// each reading; exits nonzero on the first failure.
+/// instance, a parameter value reported from inside the plugin, and its own
+/// editor. Prints each reading; exits nonzero on the first failure.
 @MainActor
 enum ClapTest {
     static let sampleRate = 48000.0
@@ -116,8 +117,7 @@ enum ClapTest {
         defer { renderer.free() }
         let before = try renderer.render(blocks: 4)
         print("before the note: peak \(db(before.max()!)) dBFS")
-        try check(MusicDeviceMIDIEvent(unit, noteOn, middleC, velocity, 0), "note on")
-        let held = try renderer.render(blocks: blocksPerSecond)
+        let held = try play(renderer, unit, on: true)
         pc_clap_unit_read_info(handle, &info)
         print("note on, \(blocksPerSecond) blocks: peak \(db(held.max()!)) dBFS; MIDI render events \(info.midi_render_events), CLAP notes sent \(info.note_events), process calls \(info.process_calls)")
         try expect(info.midi_render_events > 0, "MusicDeviceMIDIEvent reached the render block as no AURenderEventMIDI")
@@ -125,8 +125,7 @@ enum ClapTest {
         let inPlace = try renderer.render(blocks: 4, unitBuffers: true)
         print("with null mData (rendered in place into the unit's buffers): peak \(db(inPlace.max()!)) dBFS")
         try expect(db(inPlace.max()!) > soundingDb, "rendering in place yielded \(db(inPlace.max()!)) dBFS")
-        try check(MusicDeviceMIDIEvent(unit, noteOff, middleC, 0, 0), "note off")
-        let released = try renderer.render(blocks: blocksPerSecond)
+        let released = try play(renderer, unit, on: false)
         pc_clap_unit_read_info(handle, &info)
         print("note off, \(blocksPerSecond) blocks: last block peak \(db(released.last!)) dBFS; MIDI render events \(info.midi_render_events), CLAP notes sent \(info.note_events)")
         try expect(db(released.last!) < silentDb, "a second after note off the output is \(db(released.last!)) dBFS, not below \(silentDb)")
@@ -257,11 +256,89 @@ enum ClapTest {
         try expect(call.value == inside, "the observer heard \(call.value), not \(inside)")
         try expect(info.host_parameter_events == hostEvents, "the plugin's own value was sent back to it")
 
+        try checkEditor(au, unit, handle, renderer)
+
         try check(AudioUnitUninitialize(unit), "uninitialize")
         pc_clap_unit_read_info(handle, &info)
         print("uninitialized: plugin \(info.active ? "STILL ACTIVE" : "deactivated"); dropped events \(info.dropped_events)")
         try expect(!info.active, "the plugin is still active after AudioUnitUninitialize")
         try expect(info.dropped_events == 0, "\(info.dropped_events) events were dropped")
+    }
+
+    /// Middle C on or off through `MusicDeviceMIDIEvent`, then a second of
+    /// blocks; each block's peak.
+    private static func play(_ renderer: Renderer, _ unit: AudioUnit, on: Bool) throws -> [Float] {
+        if on {
+            try check(MusicDeviceMIDIEvent(unit, noteOn, middleC, velocity, 0), "note on")
+        } else {
+            try check(MusicDeviceMIDIEvent(unit, noteOff, middleC, 0, 0), "note off")
+        }
+        return try renderer.render(blocks: blocksPerSecond)
+    }
+
+    /// The plugin's own editor, asked for as `EditorWindow.open` asks a v3
+    /// unit: the view controller arrives on the main thread, its view the size
+    /// `clap.gui` get_size reports. Put in a window that is never ordered
+    /// front, the window's content takes that size, fixed when the GUI cannot
+    /// resize; closing the window destroys the GUI, the controller goes away
+    /// when released, and the plugin still plays a note.
+    private static func checkEditor(_ au: AUAudioUnit, _ unit: AudioUnit, _ handle: UnsafeMutableRawPointer, _ renderer: Renderer) throws {
+        // No Dock icon and no activation for the window below.
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        weak var gone: NSViewController?
+        try autoreleasepool {
+            var answer: (controller: NSViewController?, onMain: Bool)?
+            au.requestViewController { controller in answer = (controller, Thread.isMainThread) }
+            let deadline = Date(timeIntervalSinceNow: observerWait)
+            while answer == nil && Date() < deadline { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01)) }
+            guard let answer else { throw EngineError("requestViewController did not answer within \(observerWait) s") }
+            guard let controller = answer.controller else { throw EngineError("requestViewController answered no view controller") }
+            let view = controller.view
+            var width: UInt32 = 0, height: UInt32 = 0
+            var resizable = false
+            try expect(pc_clap_unit_gui_size(handle, &width, &height, &resizable), "clap.gui get_size reports no size while the editor is open")
+            var info = pc_clap_unit_info()
+            pc_clap_unit_read_info(handle, &info)
+            let size = NSSize(width: Double(width), height: Double(height))
+            print("editor: \(type(of: controller)) answered \(answer.onMain ? "on" : "off") the main thread; GUI \(info.editor_open ? "open" : "NOT OPEN"); view bounds \(view.bounds.size), clap.gui get_size \(width) x \(height), \(resizable ? "resizable" : "fixed size")")
+            try expect(answer.onMain, "the view controller arrived off the main thread")
+            try expect(info.editor_open, "the plugin's GUI is not open in the editor's view")
+            try expect(view.bounds.size == size, "the view is \(view.bounds.size), the GUI \(size)")
+            var secondAnswered = false
+            var second: NSViewController?
+            au.requestViewController { controller in second = controller; secondAnswered = true }
+            let secondDeadline = Date(timeIntervalSinceNow: observerWait)
+            while !secondAnswered && Date() < secondDeadline { RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01)) }
+            print("a second request while the editor is open: \(!secondAnswered ? "NO ANSWER" : second == nil ? "no view controller" : "ANOTHER VIEW CONTROLLER")")
+            try expect(secondAnswered && second == nil, "a second request while the editor is open did not answer nil")
+            // A few frames of the GUI's own drawing.
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+
+            let window = NSWindow(contentViewController: controller)
+            window.isReleasedWhenClosed = false
+            let content = window.contentRect(forFrameRect: window.frame).size
+            print("in a window never ordered front: content \(content), min \(window.contentMinSize), max \(window.contentMaxSize); visible \(window.isVisible)")
+            try expect(!window.isVisible, "the window is on screen")
+            try expect(content == size, "the window's content is \(content), the GUI \(size)")
+            if !resizable {
+                try expect(window.contentMinSize == size && window.contentMaxSize == size, "the window of a fixed-size GUI can be resized")
+            }
+            window.close()
+            pc_clap_unit_read_info(handle, &info)
+            print("window closed: GUI \(info.editor_open ? "STILL OPEN" : "destroyed")")
+            try expect(!info.editor_open, "closing the window left the plugin's GUI open")
+            window.contentViewController = nil
+            gone = controller
+        }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        print("editor released: view controller \(gone == nil ? "gone" : "STILL ALIVE")")
+        try expect(gone == nil, "the view controller outlived its release")
+
+        let held = try play(renderer, unit, on: true)
+        let released = try play(renderer, unit, on: false)
+        print("after the editor: note on peak \(db(held.max()!)) dBFS, a second after note off \(db(released.last!)) dBFS")
+        try expect(db(held.max()!) > soundingDb, "after the editor the note peaked at \(db(held.max()!)) dBFS, not above \(soundingDb)")
+        try expect(db(released.last!) < silentDb, "after the editor a second after note off is \(db(released.last!)) dBFS, not below \(silentDb)")
     }
 
     /// `AVAudioUnit.instantiate`, as `PluginInstance.make` calls it, waited for

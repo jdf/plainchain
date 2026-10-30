@@ -7,6 +7,7 @@
 #include "clap_host.h"
 
 #import <AVFoundation/AVFoundation.h>
+#import <CoreAudioKit/CoreAudioKit.h>
 #import <Foundation/Foundation.h>
 
 #include <pthread.h>
@@ -147,6 +148,7 @@ struct Core {
     const clap_plugin_note_ports_t *note_ports = nullptr;
     const clap_plugin_state_t *state = nullptr;
     const clap_plugin_latency_t *latency = nullptr;
+    const clap_plugin_gui_t *gui = nullptr;
     Dialect dialect = kNoNotes;
     /// Whether the note port also takes raw MIDI (controllers, pitch bend) beside CLAP notes.
     bool takes_midi = false;
@@ -529,6 +531,9 @@ int64_t ReadStream(const clap_istream_t *stream, void *buffer, uint64_t size) {
 - (BOOL)readParameter:(clap_id)id value:(double *)value;
 - (BOOL)postPluginParameter:(clap_id)id value:(double)value;
 - (void)readInfo:(pc_clap_unit_info *)out;
+- (BOOL)readGuiWidth:(uint32_t *)width height:(uint32_t *)height resizable:(bool *)resizable;
+/// The open editor, or nil. Main thread.
+- (ClapEditorViewController *)editor;
 @end
 
 namespace {
@@ -565,11 +570,54 @@ void HostLatencyChanged(const clap_host_t *host) { [CoreOf(host)->owner readLate
 bool HostAudioPortsIsRescanFlagSupported(const clap_host_t *, uint32_t) { return false; }
 void HostAudioPortsRescan(const clap_host_t *, uint32_t) {}
 
-void HostGuiResizeHintsChanged(const clap_host_t *) {}
-bool HostGuiRequestResize(const clap_host_t *, uint32_t, uint32_t) { return false; }
-bool HostGuiRequestShow(const clap_host_t *) { return false; }
-bool HostGuiRequestHide(const clap_host_t *) { return false; }
-void HostGuiClosed(const clap_host_t *, bool) {}
+/// `action` on the unit's open editor: now when the plugin asks on the main
+/// thread, answering whether it was done; later on the main thread when it
+/// asks from another, answering whether an editor is open.
+bool WithEditor(const clap_host_t *host, BOOL (^action)(ClapEditorViewController *editor)) {
+    __weak ClapAudioUnit *owner = CoreOf(host)->owner;
+    if (IsMainThread()) {
+        ClapEditorViewController *editor = [owner editor];
+        return editor && action(editor);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ClapEditorViewController *editor = [owner editor];
+        if (editor) action(editor);
+    });
+    return owner != nil;
+}
+
+void HostGuiResizeHintsChanged(const clap_host_t *host) {
+    WithEditor(host, ^BOOL(ClapEditorViewController *editor) {
+        [editor resizeHintsChanged];
+        return YES;
+    });
+}
+
+bool HostGuiRequestResize(const clap_host_t *host, uint32_t width, uint32_t height) {
+    return WithEditor(host, ^BOOL(ClapEditorViewController *editor) {
+        return [editor resizeTo:NSMakeSize(width, height)];
+    });
+}
+
+bool HostGuiRequestShow(const clap_host_t *host) {
+    return WithEditor(host, ^BOOL(ClapEditorViewController *editor) {
+        return [editor showWindow];
+    });
+}
+
+bool HostGuiRequestHide(const clap_host_t *host) {
+    return WithEditor(host, ^BOOL(ClapEditorViewController *editor) {
+        return [editor hideWindow];
+    });
+}
+
+/// The window closes after the plugin's call returns, since closing it destroys the GUI.
+void HostGuiClosed(const clap_host_t *host, bool was_destroyed) {
+    __weak ClapAudioUnit *owner = CoreOf(host)->owner;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[owner editor] closeWindowDestroyed:was_destroyed];
+    });
+}
 
 const clap_host_log_t kHostLog = {HostLog};
 const clap_host_thread_check_t kHostThreadCheck = {HostIsMainThread, HostIsAudioThread};
@@ -616,6 +664,8 @@ void HostRequestCallback(const clap_host_t *host) {
     AUAudioUnitBusArray *_outputBusArray;
     AUInternalRenderBlock _renderBlock;
     dispatch_source_t _drainTimer;
+    /// The editor the unit last answered `requestViewController` with, while it lives.
+    __weak ClapEditorViewController *_editor;
     /// Main thread: set while the unit itself changes tree values (values the
     /// plugin reported, a state load), which are not sent back to the plugin.
     BOOL _quietTree;
@@ -683,6 +733,7 @@ void HostRequestCallback(const clap_host_t *host) {
     c->note_ports = Extension<clap_plugin_note_ports_t>(c->plugin, CLAP_EXT_NOTE_PORTS);
     c->state = Extension<clap_plugin_state_t>(c->plugin, CLAP_EXT_STATE);
     c->latency = Extension<clap_plugin_latency_t>(c->plugin, CLAP_EXT_LATENCY);
+    c->gui = Extension<clap_plugin_gui_t>(c->plugin, CLAP_EXT_GUI);
     clap_note_port_info_t note_port{};
     if (c->note_ports && c->note_ports->count(c->plugin, true) > 0 && c->note_ports->get(c->plugin, 0, true, &note_port)) {
         // CLAP note events when the port takes them, raw MIDI otherwise.
@@ -1041,6 +1092,46 @@ void HostRequestCallback(const clap_host_t *host) {
     if (!c->state->load(c->plugin, &stream)) NSLog(@"CLAP: the plugin refused its saved state");
 }
 
+// ---- The editor
+
+/// Answered on the main thread: a view controller holding the plugin's own
+/// Cocoa GUI, or nil when the plugin has none, its GUI is already open, or
+/// it cannot be created, so the host shows a generic view instead.
+- (void)requestViewControllerWithCompletionHandler:(void (^)(AUViewControllerBase *_Nullable))completionHandler {
+    dispatch_block_t answer = ^{
+        completionHandler([self makeEditor]);
+    };
+    if (IsMainThread()) {
+        answer();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), answer);
+    }
+}
+
+- (ClapEditorViewController *)makeEditor {
+    Core *c = _core;
+    if (!c->gui || !c->gui->is_api_supported(c->plugin, CLAP_WINDOW_API_COCOA, false)) return nil;
+    if (_editor.attached) {
+        NSLog(@"CLAP: the plugin's editor is already open");
+        return nil;
+    }
+    ClapEditorViewController *editor = [[ClapEditorViewController alloc] initWithUnit:self plugin:c->plugin gui:c->gui];
+    // Loading the view creates the GUI and embeds it.
+    [editor loadViewIfNeeded];
+    if (!editor.attached) return nil;
+    _editor = editor;
+    return editor;
+}
+
+- (ClapEditorViewController *)editor { return _editor; }
+
+- (BOOL)readGuiWidth:(uint32_t *)width height:(uint32_t *)height resizable:(bool *)resizable {
+    Core *c = _core;
+    if (!c->gui || !_editor.attached) return NO;
+    *resizable = c->gui->can_resize(c->plugin);
+    return c->gui->get_size(c->plugin, width, height);
+}
+
 // ---- The C face's view of a unit
 
 - (void)readInfo:(pc_clap_unit_info *)out {
@@ -1052,6 +1143,7 @@ void HostRequestCallback(const clap_host_t *host) {
         c->inputs.empty() ? 0 : c->inputs[0],
         c->outputs[0],
         c->latency_frames,
+        _editor.attached,
         c->process_calls.load(),
         c->midi_render_events.load(),
         c->note_events.load(),
@@ -1093,6 +1185,10 @@ bool pc_clap_unit_param_value(void *unit, uint32_t param_id, double *value) {
 
 bool pc_clap_unit_post_plugin_param(void *unit, uint32_t param_id, double value) {
     return [UnitFrom(unit) postPluginParameter:param_id value:value];
+}
+
+bool pc_clap_unit_gui_size(void *unit, uint32_t *width, uint32_t *height, bool *resizable) {
+    return [UnitFrom(unit) readGuiWidth:width height:height resizable:resizable];
 }
 
 }  // extern "C"

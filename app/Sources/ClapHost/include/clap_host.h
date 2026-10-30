@@ -50,6 +50,7 @@ typedef struct pc_clap_unit_info {
     uint32_t input_channels;           /* the first input port's, 0 without one */
     uint32_t output_channels;          /* the first output port's */
     uint32_t latency_frames;
+    bool editor_open;                  /* the plugin's GUI is created and embedded in an editor's view */
     /* Counted as the events pass, from the unit's creation. */
     uint64_t process_calls;
     uint64_t midi_render_events;       /* AURenderEventMIDI events read from the render event list */
@@ -68,6 +69,9 @@ bool pc_clap_unit_param_value(void *unit, uint32_t param_id, double *value);
    plugin at the next block, and the plugin's report of it waits in the queue
    the render block fills with the values the plugin reports. */
 bool pc_clap_unit_post_plugin_param(void *unit, uint32_t param_id, double value);
+/* While an editor is open: the size the plugin's GUI reports through clap.gui
+   get_size, in points, and whether it can be resized. */
+bool pc_clap_unit_gui_size(void *unit, uint32_t *width, uint32_t *height, bool *resizable);
 
 #ifdef __cplusplus
 }
