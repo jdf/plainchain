@@ -272,6 +272,8 @@ both pass.
 
 ## Status
 
+Complete: chunks K1 through K5 are done.
+
 - 2026-10-29: plan written. K1 and K2 started.
 - 2026-10-29: K1 done in `09efb44f`: `Plainchain --clap-test <bundle>`
   (`make clap-test`, nfp5 by default) passes on the host with no device
@@ -407,3 +409,23 @@ both pass.
     held, silence a second after the release. The resizable path, the
     plugin's own requests, and nfp5's panel in a shown window are not
     exercised headless; the last is the hand test.
+- 2026-10-29: K5 done. `8b155f11ea44`: a CLAP plugin's subtype and
+  manufacturer never begin "0x" (a code that would begins "1x"), and
+  `--clap-test` derives the codes of 4096 synthetic ids, 10 of which the
+  rule moves, and finds none beginning "0x" and none with a byte outside
+  '!' through '~'; nfp5 keeps `(vw9` and `4Ys6`. `9e96db98374a`: the
+  scan reads the `CLAP_PATH` directories after the two standard ones,
+  and `--clap-test` lists the directories and scans those only
+  `CLAP_PATH` names. `4f6a30f07849`: the README's "CLAP plugins"
+  section, its layout table and build block, and the `CLAUDE.md` rules.
+  `52ef7db62055`: the MIDI smoke's model pass adds nfp5 without opening
+  its editor. The guest has no accelerated OpenGL renderer (a pixel
+  format asking for one is nil there; without the attribute one is made),
+  and nfp5's GUI (baseview) panics inside `set_parent` when it cannot
+  create its context, which aborts the process; with K4's editor, the
+  model pass's add had opened it. Gate: `make clap-test` and `make
+  records-test` pass on the host; `make clap-vm-test`, `make midi-test`,
+  and `make hotplug-test` pass in the test VM. One `make midi-test` run
+  failed at "model: quiet before held note", in the DLS synth's part,
+  after "switched to all sources" read 0.103 rather than 0.114; the
+  rerun of the same tree passed.
