@@ -372,3 +372,38 @@ both pass.
     window and an editor open) runs in no test; the smoke shows the
     bundles deinitialized after a model that held nfp5 and its editor
     window is gone.
+- 2026-10-29: K4 done in `3f2824601aa5`: `requestViewController` on a
+  bridged unit answers on the main thread with a
+  `ClapEditorViewController` (`ClapEditor.mm`) when the plugin offers
+  `clap.gui` with the cocoa API, and nil otherwise, so `EditorWindow`
+  shows `AUGenericView`. What the editor path delivers:
+  - Order: loading the view calls `create`, `can_resize`, `get_size`
+    (sizing the view and `preferredContentSize`), `set_parent` with the
+    view, and `show`. The cocoa API measures in logical points and the
+    CLAP header says not to call `set_scale` for it, so the host never
+    does; nih-plug answers false to it on macOS in any case.
+  - Windows: nfp5's GUI (nih-plug, egui through baseview) embeds into a
+    view that has no window yet, which is how `EditorWindow` loads it;
+    baseview adds its view as a subview and needs no window at
+    `set_parent`. `get_size` answers before `set_parent` (1200 by 567).
+  - Size: a GUI that cannot resize (nfp5) fixes its window's content
+    size, minimum equal to maximum. A resizable one gets the window's
+    limits from its resize hints, and a user's resize reaches it through
+    `adjust_size` and `set_size`. The plugin's `request_resize` sizes the
+    view and the window's content on the main thread and answers true;
+    from another thread it is done on the main queue.
+    `resize_hints_changed` re-reads the hints; `request_show` and
+    `request_hide` order the window front or out, which shows or hides
+    the GUI; `closed` closes the window.
+  - Lifetime: the GUI is destroyed when its window closes, or when the
+    controller goes away first; the controller holds the unit, so the
+    plugin outlives its GUI. A second request while a GUI is open
+    answers nil, since a CLAP plugin has one GUI.
+  - `--clap-test` asks for the controller as `EditorWindow` does, checks
+    it arrives on the main thread with the view at `get_size`'s size,
+    puts it in a window never ordered front (content 1200 by 567,
+    fixed), closes the window (the GUI is destroyed), releases the
+    controller (it goes away), and plays the note again: -18.1 dBFS
+    held, silence a second after the release. The resizable path, the
+    plugin's own requests, and nfp5's panel in a shown window are not
+    exercised headless; the last is the hand test.
