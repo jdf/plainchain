@@ -244,7 +244,7 @@ enum Smoke {
         } catch let e as EngineError where e.message == "absent: CLAP plugin not installed" {
             print("  reopening a CLAP item whose bundle is gone: \(e.message)")
         }
-        let bundle = Plugins.clapDirectories[0] + "/nfp5.clap"
+        let bundle = Plugins.standardClapDirectories[0] + "/nfp5.clap"
         guard FileManager.default.fileExists(atPath: bundle) else {
             print("  nfp5 is not installed at \(bundle); the reopen check is skipped")
             return

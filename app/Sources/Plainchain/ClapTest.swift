@@ -6,7 +6,9 @@ import Foundation
 
 /// `Plainchain --clap-test <bundle.clap>`
 /// Headless check of the CLAP bridge that opens no audio device: registers
-/// the bundle's plugins as in-process Audio Units, creates its first plugin
+/// the bundle's plugins as in-process Audio Units, lists the directories the
+/// app scans (a `CLAP_PATH` directory is scanned here too), checks the
+/// component codes derived from CLAP ids, creates the bundle's first plugin
 /// (an instrument) through `AVAudioUnit.instantiate` as `PluginInstance.make`
 /// does, and drives it through the C API the engine uses: the stream format,
 /// maximum frames, `AudioUnitInitialize`, `MusicDeviceMIDIEvent`, and
@@ -59,6 +61,7 @@ enum ClapTest {
         let scanned = pc_clap_scan(directory)
         print("scan of \(directory): \(scanned) plugin(s)")
         try expect(scanned >= registered, "the scan found fewer plugins than the bundle holds")
+        try checkDirectories()
         var mine: [pc_clap_plugin] = []
         for i in 0..<pc_clap_count() {
             var p = pc_clap_plugin()
@@ -264,6 +267,28 @@ enum ClapTest {
         print("uninitialized: plugin \(info.active ? "STILL ACTIVE" : "deactivated"); dropped events \(info.dropped_events)")
         try expect(!info.active, "the plugin is still active after AudioUnitUninitialize")
         try expect(info.dropped_events == 0, "\(info.dropped_events) events were dropped")
+    }
+
+    /// A `CLAP_PATH` value with an empty entry, a trailing slash, a `..`, a
+    /// repeat, and a standard directory, and the directories it adds.
+    static let syntheticClapPath = "/Volumes/A/CLAP::/Volumes/B/CLAP/:/Volumes/A/CLAP:/Volumes/C/x/../CLAP:/Library/Audio/Plug-Ins/CLAP"
+    static let syntheticClapPathAdds = ["/Volumes/A/CLAP", "/Volumes/B/CLAP", "/Volumes/C/CLAP"]
+
+    /// The directories the app scans: the standard two, then `CLAP_PATH`'s,
+    /// each listed; a directory only `CLAP_PATH` names is scanned here as
+    /// well. Then the reading of a made-up `CLAP_PATH`.
+    private static func checkDirectories() throws {
+        let clapPath = ProcessInfo.processInfo.environment["CLAP_PATH"]
+        let directories = Plugins.clapDirectories
+        print("directories the app scans (CLAP_PATH \(clapPath.map { "\"\($0)\"" } ?? "unset")):")
+        for directory in directories {
+            let standard = Plugins.standardClapDirectories.contains(directory)
+            print("  \(directory)\(standard ? "" : ": \(pc_clap_scan(directory)) plugin(s)")")
+        }
+        try expect(Array(directories.prefix(2)) == Plugins.standardClapDirectories, "the standard directories are not scanned first")
+        let read = Plugins.clapDirectories(clapPath: syntheticClapPath)
+        print("CLAP_PATH \"\(syntheticClapPath)\" adds \(read.dropFirst(2))")
+        try expect(read == Plugins.standardClapDirectories + syntheticClapPathAdds, "CLAP_PATH read as \(read)")
     }
 
     /// Synthetic CLAP ids whose component codes the check derives; among them

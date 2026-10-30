@@ -16,9 +16,28 @@ struct Plugin: Identifiable, Hashable {
 enum Plugins {
     /// Where CLAP plugins are installed, the user's own first: a plugin in both
     /// is registered from the user's.
-    static var clapDirectories: [String] {
+    static var standardClapDirectories: [String] {
         [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Audio/Plug-Ins/CLAP").path,
          "/Library/Audio/Plug-Ins/CLAP"]
+    }
+
+    /// The directories scanned for CLAP plugins, in order: the standard two,
+    /// then each directory the `CLAP_PATH` environment variable lists.
+    static var clapDirectories: [String] {
+        clapDirectories(clapPath: ProcessInfo.processInfo.environment["CLAP_PATH"])
+    }
+
+    /// The standard directories, then those of `clapPath`, a colon-separated
+    /// list as the CLAP entry header asks a host to read. Empty entries are
+    /// skipped, each path is standardized as Foundation's `standardizedFileURL`
+    /// does, and a directory listed twice is scanned once, at its first place.
+    static func clapDirectories(clapPath: String?) -> [String] {
+        var out: [String] = []
+        for entry in standardClapDirectories + (clapPath ?? "").split(separator: ":").map(String.init) {
+            let directory = URL(fileURLWithPath: entry).standardizedFileURL.path
+            if !out.contains(directory) { out.append(directory) }
+        }
+        return out
     }
 
     /// Registers every CLAP plugin under `clapDirectories` as an in-process
