@@ -63,6 +63,8 @@ final class Model: ObservableObject {
     /// Read-only meter parameters that report gain reduction, where a plugin has one.
     private var reductionMeters: [UUID: Plugins.ReductionMeter] = [:]
     private var editors: [UUID: EditorWindow] = [:]
+    /// Whether adding a plugin opens its editor once the graph is rebuilt.
+    var opensEditorOnAdd = true
     private var engine: Engine? {
         // MIDI delivery stops before the graph that drains it goes away.
         willSet { if newValue !== engine { midi.active = 0 } }
@@ -265,7 +267,7 @@ final class Model: ObservableObject {
                 }
                 // Some plugins only offer their view once initialized, so wait for the rebuild.
                 await restartTask?.value
-                guard !closed else { return }
+                guard !closed, opensEditorOnAdd else { return }
                 openEditor(item)
             } catch {
                 self.error = "\(plugin.name): \(error.localizedDescription)"

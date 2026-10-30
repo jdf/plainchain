@@ -794,6 +794,11 @@ enum Smoke {
             throw EngineError("model: the plugin list does not offer \(clap.name) as an instrument")
         }
         model.remove(at: [0])
+        // The guest has no accelerated OpenGL renderer, and nfp5's GUI (baseview)
+        // aborts the process when it cannot create its OpenGL context; the editor
+        // path is checked on the host by --clap-test.
+        model.opensEditorOnAdd = false
+        defer { model.opensEditorOnAdd = true }
         try until("DLS synth removed", 3) { model.session.chain.count == 2 && !model.hasInstrument && model.status.running && model.error == nil }
         model.add(listed)
         try until("\(clap.name) added", 5) {
