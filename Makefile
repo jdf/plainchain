@@ -11,7 +11,7 @@ ICONSRC := app/Assets/icon-1024.png
 SIGN    := $(if $(DEVELOPER_ID_APPLICATION),"$(DEVELOPER_ID_APPLICATION)",-)
 PROFILE ?= plainchain
 
-.PHONY: all app bundle run install smoke hotplug-test midi-test clean icon notarize dist
+.PHONY: all app bundle run install smoke hotplug-test midi-test clap-test clean icon notarize dist
 
 all: bundle
 
@@ -81,6 +81,12 @@ hotplug-test: bundle
 # app's virtual destination (Plainchain --smoke with PC_MIDI=1).
 midi-test: bundle
 	tools/testvm.sh midi
+
+# The CLAP bridge, headless and with no audio device, so it runs on the host:
+# CLAP names the bundle, nfp5 by default.
+CLAP ?= $(HOME)/Library/Audio/Plug-Ins/CLAP/nfp5.clap
+clap-test: bundle
+	"$(BUNDLE)/Contents/MacOS/$(APP)" --clap-test "$(CLAP)"
 
 clean:
 	rm -rf app/.build "$(BUILD)"

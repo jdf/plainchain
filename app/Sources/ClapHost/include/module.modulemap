@@ -1,0 +1,5 @@
+// Swift sees the C face only; the vendored CLAP headers beside it are for the target's own sources.
+module ClapHost {
+    header "clap_host.h"
+    export *
+}

@@ -8,6 +8,8 @@ enum Main {
             Smoke.run()
         } else if CommandLine.arguments.contains("--hotplug-test") {
             MainActor.assumeIsolated { HotplugTest.run() }
+        } else if CommandLine.arguments.contains("--clap-test") {
+            MainActor.assumeIsolated { ClapTest.run() }
         } else {
             // Session windows are restored from AppState's own list, not by AppKit's window restoration.
             UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": true])

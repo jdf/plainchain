@@ -16,9 +16,22 @@ let package = Package(
             // Static, so the bundle does not depend on Homebrew at runtime.
             linkerSettings: [.unsafeFlags(["\(brew)/lib/libcapnp.a", "\(brew)/lib/libkj.a"])]
         ),
+        // CLAP plugins hosted as in-process Audio Units; Objective-C++ over the vendored CLAP headers.
+        .target(
+            name: "ClapHost",
+            path: "Sources/ClapHost",
+            exclude: ["include/clap/LICENSE"],
+            cxxSettings: [.unsafeFlags(["-fobjc-arc"])],
+            linkerSettings: [
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreAudioKit"),
+                .linkedFramework("AppKit"),
+            ]
+        ),
         .executableTarget(
             name: "Plainchain",
-            dependencies: ["CapnSession"],
+            dependencies: ["CapnSession", "ClapHost"],
             path: "Sources/Plainchain",
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
