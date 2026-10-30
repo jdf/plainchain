@@ -331,3 +331,44 @@ both pass.
   written at format version 5. `Plainchain --records-test` (`make
   records-test`, also run by the smoke) round-trips such a session at
   version 5 and shows a newer file refused, with no device opened.
+- 2026-10-29: K3 done in `077ecb78156d`. `tools/testvm.sh clap` (`make
+  clap-vm-test`) and `make midi-test` pass in the test VM; `make
+  hotplug-test` passes too, and `--clap-test` and `--records-test` pass
+  on the host. What K5 should know:
+  - `tools/testvm.sh clap` exists: it pushes the app and
+    `~/Library/Audio/Plug-Ins/CLAP/nfp5.clap` into the guest's own CLAP
+    directory, where nfp5 stays, and runs `Plainchain --smoke nfp5` on
+    BlackHole in the Aqua session. With nfp5 in the guest, `make
+    midi-test` also plays nfp5 in place of the DLS synth through the
+    virtual source and drives the app model through adding it, saving
+    the session, and reopening it; without nfp5 it says so and skips.
+  - The scan covers `~/Library/Audio/Plug-Ins/CLAP`, then
+    `/Library/Audio/Plug-Ins/CLAP`, and the folders under them, as the
+    CLAP entry header asks (u-he installs into a `u-he` folder); a
+    plugin in both is registered from the user's. `CLAP_PATH`, which the
+    same header says a host must also read, is not read. jdf's 25
+    FabFilter and u-he plugins register in 0.7 s; every FabFilter CLAP
+    plugin but One and Twin 3 has a note input port, so it registers as
+    `aumf` and is offered MIDI as a music effect.
+  - The bundles are deinitialized by `pc_clap_shutdown()`, called once
+    no plugin is alive: by `AppState.shutdown()` after the models have
+    disposed their plugins, and by `--clap-test`, `--smoke`, and
+    `--records-test` before they exit. Nothing deinitializes them at
+    exit: an atexit handler runs after the static destructors of every
+    bundle loaded after it registered, and FabFilter Micro's deinit then
+    locked a destroyed mutex and aborted. The deinit at shutdown is kept,
+    not dropped, because it is the order every host uses and it held for
+    all 25 of jdf's bundles: entries deinitialized, then a clean exit.
+    With a plugin still alive at shutdown the bundles stay initialized
+    and ClapHost logs it.
+  - A chain item's CLAP id decides: `PluginInstance.make` takes the
+    registry's component description and bundle path for it (registering
+    the item's path when the registry lacks the id), and the loaded
+    session keeps those, so a moved bundle is followed. A missing bundle
+    reports "<bundle name>: CLAP plugin not installed".
+  - `--records-test` makes one nfp5 instance from its bundle path when
+    nfp5 is in `~/Library/Audio/Plug-Ins/CLAP`; it still opens no device.
+  - The app's own quit path (`AppState.shutdown()` with a session
+    window and an editor open) runs in no test; the smoke shows the
+    bundles deinitialized after a model that held nfp5 and its editor
+    window is gone.
