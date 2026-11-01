@@ -70,6 +70,17 @@ final class EditorWindow: NSWindow {
         return unsafeBitCast(msgSend, to: ViewFn.self)(factory, viewSel, unit, NSSize(width: 0, height: 0))
     }
 
+    /// ⌘W closes the editor. A plugin's view sees key equivalents before the
+    /// menu does and may swallow them, so the window answers this one first.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags == .command, event.charactersIgnoringModifiers == "w" {
+            performClose(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func close() {
         onClose?()
         onClose = nil
