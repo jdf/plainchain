@@ -72,7 +72,7 @@ Each window is an independent session with its own input (an audio device and a 
 
 The buffer size belongs to the device, not the session: changing it in one window changes it for every window on that device, and their status bars pick it up within a second.
 
-File ▸ New Session (⌘N) opens a new untitled window. Opening a session file (File ▸ Open Session…, Finder, `open`) brings its window forward if it is already open, loads it into the front window if that one is untitled and untouched, and otherwise opens a new window. Save and Save As act on the front session window. Closing a window that holds something unsaved (an untitled session with any plugin or non-default devices, or a titled one with edits) asks Save / Don't Save / Cancel. Quitting never asks: every open window is autosaved and comes back at the next launch, in the same order.
+File ▸ New Session (⌘N) opens a new untitled window. Opening a session file (File ▸ Open Session…, Finder, `open`) brings its window forward if it is already open, loads it into the front window if that one is untitled and untouched, and otherwise opens a new window. Save and Save As act on the front session window. Closing a window that holds something unsaved (an untitled session with any plugin or non-default devices, or a titled one with edits) asks Save / Don't Save / Cancel. Quitting never asks: every open window is autosaved and comes back at the next launch, in the same order. A launch with no window to bring back opens the last session: the titled session most recently closed, saved, or loaded, as long as its file still exists.
 
 ## How the engine works
 
@@ -163,7 +163,7 @@ Constraints:
 - An instrument's input bus, when it has one, runs at the chain's width like an effect's; a vocoder that only takes stereo needs two input channels. An instrument without one leaves a device input unused.
 - Changing devices, channels, or adding or removing a plugin tears down and rebuilds the graph (a brief dropout). Reordering is live: the output fades to silence over 8 ms, the stages are repointed on the render thread, and it fades back in. Bypass and trim are applied live.
 
-The engine starts running when its window opens; the Run switch pauses it. The open windows are listed, in order, under `openSessions` in `defaults read com.plainchain.app` (a session file's path, or none for an untitled session, and an id). Each window autosaves to `~/Library/Application Support/Plainchain/Autosave-<id>.plainchain`: always for an untitled session, and for a titled one while it has unsaved edits, which come back at the next launch still marked as edited. Closing a window on purpose deletes its autosave. Versions before session windows kept one `Autosave.plainchain` and a `sessionPath` default; the first launch moves them into the list.
+The engine starts running when its window opens; the Run switch pauses it. The open windows are listed, in order, under `openSessions` in `defaults read com.plainchain.app` (a session file's path, or none for an untitled session, and an id). Each window autosaves to `~/Library/Application Support/Plainchain/Autosave-<id>.plainchain`: always for an untitled session, and for a titled one while it has unsaved edits, which come back at the next launch still marked as edited. Closing a window on purpose deletes its autosave. The last session's path is the `lastSession` default. Versions before session windows kept one `Autosave.plainchain` and a `sessionPath` default; the first launch moves them into the list.
 
 ## License
 

@@ -54,6 +54,7 @@ final class AppState: ObservableObject {
     var lastFocused: Model? { liveModels.first { $0.id == lastFocusedID } }
 
     private static let openSessionsKey = "openSessions"
+    private static let lastSessionKey = "lastSession"
     private static let legacySessionPathKey = "sessionPath"
 
     init(ephemeral: Bool = false, midi: MidiSystem = MidiSystem()) {
@@ -120,22 +121,25 @@ final class AppState: ObservableObject {
         writeOpenSessions()
     }
 
-    /// A window closed on purpose: it leaves the restore list.
+    /// A window closed on purpose: it leaves the restore list, and a titled
+    /// one becomes the last session.
     func unregister(_ model: Model) {
         models.removeAll { $0.model == nil || $0.model === model }
         if lastFocusedID == model.id { lastFocusedID = nil }
+        rememberLastSession(model.ref.path)
         writeOpenSessions()
     }
 
     /// The session for a window SwiftUI opened without one: at launch the
-    /// first saved session (the others are queued for `windowAppeared`), else a new untitled one.
+    /// first saved session (the others are queued for `windowAppeared`), else
+    /// the last session, else a new untitled one.
     func initialRef() -> SessionRef {
         guard !launched, !ephemeral else { return SessionRef() }
         launched = true
         let saved = savedRefs()
         launchQueue = Array(saved.dropFirst())
         pendingRefs = launchQueue
-        let first = saved.first ?? SessionRef()
+        let first = saved.first ?? lastSessionRef() ?? SessionRef()
         launchID = first.id
         return first
     }
@@ -212,11 +216,27 @@ final class AppState: ObservableObject {
 
     // MARK: Restore list
 
-    /// The open sessions, in window order, for the next launch.
+    /// The open sessions, in window order, for the next launch; the focused
+    /// titled one, else the last titled one, is the last session.
     func writeOpenSessions() {
         guard !ephemeral else { return }
-        let refs = liveModels.filter { !$0.closed }.map(\.ref) + pendingRefs
+        let live = liveModels.filter { !$0.closed }
+        let refs = live.map(\.ref) + pendingRefs
         if let data = try? JSONEncoder().encode(refs) { UserDefaults.standard.set(data, forKey: Self.openSessionsKey) }
+        rememberLastSession(lastFocused?.ref.path ?? live.last { $0.ref.path != nil }?.ref.path)
+    }
+
+    /// The last session: the titled session most recently closed, saved, or
+    /// loaded, which a launch that restores no open session opens. An
+    /// untitled session has no file to come back to.
+    private func rememberLastSession(_ path: String?) {
+        guard !ephemeral, let path else { return }
+        UserDefaults.standard.set(path, forKey: Self.lastSessionKey)
+    }
+
+    private func lastSessionRef() -> SessionRef? {
+        guard let path = UserDefaults.standard.string(forKey: Self.lastSessionKey), FileManager.default.fileExists(atPath: path) else { return nil }
+        return SessionRef(path: path)
     }
 
     /// The sessions open at the last quit. The first launch after the move to
