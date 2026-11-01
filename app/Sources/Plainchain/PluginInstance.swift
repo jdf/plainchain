@@ -1,4 +1,5 @@
 import AudioToolbox
+import ClapHost
 import AVFoundation
 import Foundation
 
@@ -102,7 +103,11 @@ final class PluginInstance {
         set {
             guard let newValue, let dict = try? PropertyListSerialization.propertyList(from: newValue, format: nil) as? [String: Any] else { return }
             if let avUnit {
-                avUnit.auAudioUnit.fullState = dict
+                // Through ClapHost, which catches the exception AudioToolbox
+                // raises for a saved parameter tree the unit no longer matches.
+                let unit = Unmanaged.passUnretained(avUnit.auAudioUnit).toOpaque()
+                let state = Unmanaged.passUnretained(dict as NSDictionary).toOpaque()
+                _ = pc_au_set_full_state(unit, state)
             } else {
                 var plist: CFPropertyList = dict as CFDictionary
                 _ = AudioUnitSetProperty(audioUnit, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &plist, UInt32(MemoryLayout<CFPropertyList>.size))

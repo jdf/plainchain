@@ -1083,7 +1083,14 @@ void HostRequestCallback(const clap_host_t *host) {
     // With the plugin's own bytes present, the parameter values the base
     // class restores stay in the tree; the bytes are what the plugin loads.
     _quietTree = data != nil;
-    [super setFullState:fullState];
+    @try {
+        [super setFullState:fullState];
+    } @catch (NSException *exception) {
+        // The base class deserializes the saved parameter tree, which no
+        // longer matches when the plugin's parameters changed since the
+        // save; the plugin's own bytes below carry what matters.
+        NSLog(@"CLAP: the saved parameter tree was refused (%@: %@); the plugin's own state loads", exception.name, exception.reason);
+    }
     _quietTree = NO;
     Core *c = _core;
     if (!data || !c->state) return;
@@ -1171,6 +1178,18 @@ ClapAudioUnit *UnitFrom(void *unit) {
 }  // namespace
 
 extern "C" {
+
+bool pc_au_set_full_state(void *unit, void *state) {
+    AUAudioUnit *au = (__bridge AUAudioUnit *)unit;
+    NSDictionary<NSString *, id> *dictionary = (__bridge NSDictionary<NSString *, id> *)state;
+    @try {
+        au.fullState = dictionary;
+        return true;
+    } @catch (NSException *exception) {
+        NSLog(@"%@: the saved state was refused (%@: %@)", au.audioUnitName ?: @"a unit", exception.name, exception.reason);
+        return false;
+    }
+}
 
 bool pc_clap_unit_read_info(void *unit, pc_clap_unit_info *out) {
     ClapAudioUnit *clap = UnitFrom(unit);

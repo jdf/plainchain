@@ -68,6 +68,12 @@ typedef struct pc_clap_unit_info {
 } pc_clap_unit_info;
 
 bool pc_clap_unit_read_info(void *unit, pc_clap_unit_info *out);
+/* Restores `state`, an NSDictionary as `fullState` gave it, on `unit`, any AUAudioUnit (both unretained).
+   AudioToolbox raises an Objective-C exception when the saved parameter tree no longer matches the unit's,
+   which happens after a plugin's parameters change between a save and a load; the exception is caught here,
+   logged, and never reaches the caller, since one unwinding through Swift frames leaves the runtime in an
+   undefined state. Returns whether the restore raised nothing. A ClapAudioUnit loads its own bytes either way. */
+bool pc_au_set_full_state(void *unit, void *state);
 /* The parameter's value as the plugin reports it through clap.params get_value. */
 bool pc_clap_unit_param_value(void *unit, uint32_t param_id, double *value);
 /* As if the plugin's own editor had moved a parameter: the value reaches the
