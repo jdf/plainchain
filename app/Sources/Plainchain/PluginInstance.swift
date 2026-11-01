@@ -105,9 +105,12 @@ final class PluginInstance {
             if let avUnit {
                 // Through ClapHost, which catches the exception AudioToolbox
                 // raises for a saved parameter tree the unit no longer matches.
-                let unit = Unmanaged.passUnretained(avUnit.auAudioUnit).toOpaque()
-                let state = Unmanaged.passUnretained(dict as NSDictionary).toOpaque()
-                _ = pc_au_set_full_state(unit, state)
+                let unit = avUnit.auAudioUnit
+                let state = dict as NSDictionary
+                // Both objects stay alive across the call, which borrows them.
+                withExtendedLifetime((unit, state)) {
+                    _ = pc_au_set_full_state(Unmanaged.passUnretained(unit).toOpaque(), Unmanaged.passUnretained(state).toOpaque())
+                }
             } else {
                 var plist: CFPropertyList = dict as CFDictionary
                 _ = AudioUnitSetProperty(audioUnit, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &plist, UInt32(MemoryLayout<CFPropertyList>.size))
