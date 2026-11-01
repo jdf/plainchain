@@ -110,7 +110,11 @@ final class Model: ObservableObject {
         restoreTask = Task {
             guard !ephemeral else { return }
             let file = ref.path.map { URL(fileURLWithPath: $0) }
-            if let saved = try? SessionFile.read(SessionFile.autosaveURL(for: ref.id)) {
+            // A titled session without unsaved edits has no autosave; the
+            // read is attempted only where one exists, since SQLite logs an
+            // open that fails as an error.
+            let autosave = SessionFile.autosaveURL(for: ref.id)
+            if FileManager.default.fileExists(atPath: autosave.path), let saved = try? SessionFile.read(autosave) {
                 await load(saved, from: file)
                 guard !Task.isCancelled, !closed else { return }
                 if file != nil { dirty = true }  // a titled session's autosave holds edits not yet saved
